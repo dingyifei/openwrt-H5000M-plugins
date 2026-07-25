@@ -30,7 +30,9 @@ signature-verified), **not** rebuilt. See `../openwrt-H5000M/docs/phase2-package
   The firmware's embedded trust anchor pins its fingerprint. Ephemeral SDK keys are
   development-only and their artifacts are marked non-publishable.
 - No baked secrets (Wi-Fi/eSIM/VPN/Tailscale/proxy credentials, live daemon state).
-- Pin everything: SDK, external sources, resolved package closure — reproducible offline build.
+- Rolling for the OpenWrt snapshot (SDK/feeds tracked live, integrity-checked against the
+  mirror's `sha256sums`); still **pin external SOURCES** (our source-built packages) by
+  repo/commit/hash in `configs/sources.lock`. Base + plugins must share one snapshot.
 
 ## Layout
 
@@ -63,11 +65,12 @@ tests/                 # mocked-UCI / state-machine / package tests
 
 ## Status
 
-✅ **SDK re-pin done.** The base was re-pinned to snapshot **r35533-3b2bc55dcb** (kernel
-6.18.39), and the matching SDK is pinned in `configs/openwrt-sdk.env` and **preserved**
-locally (`~/.cache/openwrt-H5000M/preserved/`) — snapshots roll ~hourly and are not
-archived, so `scripts/fetch-official-sdk.sh` will only succeed against the live mirror
-while it still serves r35533; otherwise seed `dl/` from the preserved tarball.
+**Rolling model** (chosen 2026-07-25). No SDK/feed pinning or off-machine tarball
+preservation: `scripts/fetch-official-sdk.sh` fetches the current SDK from the live mirror
+and integrity-checks it against the mirror's own `sha256sums`. The base is built in
+`OPENWRT_ROLLING=1` mode; **build the base and these plugins from the same snapshot in one
+run** so kmods/deps agree (this feature set builds no kmods, so ABI risk is minimal).
 
-Next: implement `configure-sdk.sh` / `build-packages.sh` etc. against the fetched SDK, and
-pin the first source-built package (luci-app-epm or PassWall2) in `configs/sources.lock`.
+Next: implement `configure-sdk.sh` / `build-packages.sh` against the fetched SDK, and pin
+the first source-built package (luci-app-epm or PassWall2) in `configs/sources.lock`
+(external *source* pins still matter — only the OpenWrt snapshot itself rolls).
