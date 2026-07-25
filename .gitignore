@@ -1,0 +1,22 @@
+# build outputs / fetched toolchains — never committed
+/sdk/
+/build_dir/
+/staging_dir/
+/bin/
+/dl/
+/offline-repo/
+/artifacts/
+*.tar.zst
+*.tar.xz
+*.apk
+
+# secrets / keys — the persistent signing key lives outside git
+*.pem
+*.key
+/keys/
+
+# scratch
+/.work/
+*.log
+.DS_Store
+__pycache__/

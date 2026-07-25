@@ -1,0 +1,19 @@
+# Immutable pins for every EXTERNAL source we build (repo, commit/tag, archive sha256,
+# license, expected package output). Empty until a source-built package is added.
+# Format (one block per source):
+#
+#   [luci-app-epm]
+#   repo   = https://github.com/<owner>/luci-app-epm
+#   commit = <full-40-char-sha>
+#   sha256 = <archive-sha256>
+#   license= <spdx>
+#   builds = luci-app-epm
+#
+#   [passwall2]
+#   repo   = https://github.com/xiaorouji/openwrt-passwall2
+#   commit = <full-40-char-sha>
+#   sha256 = <archive-sha256>
+#   license= GPL-3.0-only
+#   builds = luci-app-passwall2 passwall2
+#
+# (proxy engines sing-box/xray/v2ray/hysteria/trojan come from the OFFICIAL feed — not here)

@@ -1,0 +1,29 @@
+name: build-plugins
+on:
+  push: { branches: [master] }
+  pull_request: { branches: [master] }
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax check
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+      - name: Fetch + verify SDK
+        run: ./scripts/fetch-official-sdk.sh
+      - name: Configure SDK (packages only)
+        run: ./scripts/configure-sdk.sh
+      - name: Build packages (signed)
+        env: { H5000M_APK_SIGNING_KEY: ${{ secrets.H5000M_APK_SIGNING_KEY }} }
+        run: ./scripts/build-packages.sh
+      - name: Build signed offline repo
+        run: ./scripts/build-offline-repo.sh
+      - name: Verify offline install into exact base
+        run: ./scripts/verify-offline-install.sh
+      - name: Secret scan
+        run: ./scripts/check-secrets.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: offline-repo, path: offline-repo/ }
+# NOTE: release signing uses a protected persistent key/runner; never log private material.

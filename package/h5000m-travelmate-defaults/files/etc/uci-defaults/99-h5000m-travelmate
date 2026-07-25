@@ -1,0 +1,22 @@
+#!/bin/sh
+# H5000M Travelmate defaults — idempotent first-boot setup.
+# Establishes exactly one disabled STA VIF bound to trm_wwan, owned by Travelmate.
+# Full Phase 3.1 logic is TODO; this skeleton is idempotent and safe to re-run.
+#
+# Hard rules: preserve discovered AP sections; no baked SSID/PSK; never assume mtwifi/.dat.
+set -e
+
+MARK=/etc/h5000m/.travelmate-defaults-applied
+[ -f "$MARK" ] && exit 0            # idempotent: already applied
+
+# TODO(Phase 3.1):
+#   - discover the mac80211 radio(s) generically (radio0/radio1), do NOT hard-code
+#   - create/normalize exactly ONE disabled wifi-iface mode='sta' network='trm_wwan'
+#   - create the trm_wwan interface (proto dhcp) + firewall membership owned by Travelmate
+#   - leave it disabled; no SSID/PSK
+#   - commit wireless/network/firewall
+# Reference: ../openwrt-H5000M/ROADMAP.md (3.1), plan file Phase 3.1.
+
+mkdir -p /etc/h5000m
+touch "$MARK"
+exit 0
