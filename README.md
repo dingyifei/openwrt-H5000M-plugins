@@ -63,8 +63,11 @@ tests/                 # mocked-UCI / state-machine / package tests
 
 ## Status
 
-⛔ **Blocked on the SDK re-pin.** The base is pinned at snapshot r35420, whose SDK is no
-longer downloadable (snapshots aren't archived). The base must first be re-pinned to a
-current snapshot (see `../openwrt-H5000M` WS-D-pre) that ships a fetchable SDK; then
-`configs/openwrt-sdk.env` here is filled with that revision + SDK SHA256. Scripts and
-structure are revision-agnostic and ready.
+✅ **SDK re-pin done.** The base was re-pinned to snapshot **r35533-3b2bc55dcb** (kernel
+6.18.39), and the matching SDK is pinned in `configs/openwrt-sdk.env` and **preserved**
+locally (`~/.cache/openwrt-H5000M/preserved/`) — snapshots roll ~hourly and are not
+archived, so `scripts/fetch-official-sdk.sh` will only succeed against the live mirror
+while it still serves r35533; otherwise seed `dl/` from the preserved tarball.
+
+Next: implement `configure-sdk.sh` / `build-packages.sh` etc. against the fetched SDK, and
+pin the first source-built package (luci-app-epm or PassWall2) in `configs/sources.lock`.
