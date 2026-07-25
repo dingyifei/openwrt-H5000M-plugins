@@ -1,0 +1,4 @@
+# Packages built from this repo, one name per line (each maps to package/<name>/).
+# Blank lines and lines starting with '#' are ignored. configure-sdk.sh seeds exactly these
+# as CONFIG_PACKAGE_<name>=m; build-packages.sh builds each, in order, and signs it.
+h5000m-travelmate-defaults

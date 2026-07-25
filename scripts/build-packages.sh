@@ -1,17 +1,154 @@
 #!/usr/bin/env bash
-# build-packages.sh — deterministic build of the custom + source-built packages, signed
-# with the persistent key. Never uses an ephemeral key for publishable artifacts.
+# build-packages.sh — build + sign the packages in configs/build-list, verify each signed
+# .apk, index them, and record the resolved closure to configs/packages.lock.
 #
-# Contract:
-#   in:  configured ./sdk (configure-sdk.sh), package/*, patches/*, configs/sources.lock
-#   out: signed APKs under ./bin, recorded into configs/packages.lock
-#   rules: pin every external source to sources.lock (repo/commit/hash); EPM patch --fuzz=0
+# Preconditions: configure-sdk.sh has run (sdk/.h5000m-configured present) and the placed
+# signing key still hashes to the configured fingerprint.
+#
+# Per-.apk post-conditions (all fatal):
+#   * container magic is ADBd;
+#   * `apk verify --keys-dir <ABS trust dir>` exits 0 (the built package is properly signed);
+#   * the same verify with an EMPTY keys-dir exits non-zero (proves the check is real);
+#   * arch is "noarch" for a PKGARCH:=all recipe.
+# Then `make package/index` builds a signed packages.adb, which `apk verify` must also accept.
+#
+# configs/packages.lock is regenerated (sorted; provenance header). With --check the script
+# fails if the freshly generated lock differs from the committed one instead of rewriting it.
+#
+# Third-party source-built packages are NOT part of this batch: configs/sources.lock must be
+# empty, and this script fails loudly if it is not (rather than silently skipping them).
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-echo "TODO: for each source-built pkg (passwall2 wrapper, luci-app-epm), fetch pinned"
-echo "      source per configs/sources.lock and verify hash before build."
-echo "TODO: (cd sdk && make package/h5000m-travelmate-defaults/compile V=s) etc."
-echo "TODO: apply patches/luci-app-epm at --fuzz=0 (fail on fuzz)."
-echo "TODO: sign built APKs with the persistent key; record name/version/arch/sha256 ->"
-echo "      configs/packages.lock"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+# shellcheck source=../configs/openwrt-sdk.env
+source configs/openwrt-sdk.env
+
+SDK="${ROOT_DIR}/sdk"
+APK="${SDK}/staging_dir/host/bin/apk"
+CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+
+fail() { echo "build-packages: $*" >&2; exit 1; }
+
+[ -f "${SDK}/.h5000m-configured" ] || fail "SDK not configured — run scripts/configure-sdk.sh"
+[ -x "${APK}" ] || fail "missing SDK apk host tool at ${APK}"
+
+# provenance from the configure marker
+revision="$(sed -n 's/^revision=//p' "${SDK}/.h5000m-configured")"
+feeds_lock_sha="$(sed -n 's/^feeds_lock_sha256=//p' "${SDK}/.h5000m-configured")"
+configured_fpr="$(sed -n 's/^key_fingerprint=//p' "${SDK}/.h5000m-configured")"
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  else shasum -a 256 | cut -d' ' -f1; fi
+}
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+key_fingerprint() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256_hex; }
+
+# --- third-party source stub (loud) ---
+sources_nonblank="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' configs/sources.lock || true)"
+[ -z "${sources_nonblank}" ] || fail "configs/sources.lock is non-empty but source-built packages are not implemented in this batch — refusing to silently skip them"
+
+# --- key drift guard ---
+placed_fpr="$(key_fingerprint "${SDK}/private-key.pem")"
+[ "${placed_fpr}" = "${configured_fpr}" ] || fail "SDK signing key changed since configure (${placed_fpr} != ${configured_fpr})"
+
+# --- trust dirs for apk verify ---
+TRUST_DIR="$(mktemp -d)"; EMPTY_DIR="$(mktemp -d)"
+trap 'rm -rf "${TRUST_DIR}" "${EMPTY_DIR}"' EXIT
+cp "${SDK}/public-key.pem" "${TRUST_DIR}/h5000m-plugins.pem"
+TRUST_DIR="$(cd "${TRUST_DIR}" && pwd -P)"   # apk needs an ABSOLUTE keys-dir
+EMPTY_DIR="$(cd "${EMPTY_DIR}" && pwd -P)"
+
+apk_field() {  # apk_field <file> <field>  — read a top-level scalar from the ADB container
+  "${APK}" adbdump "$1" 2>/dev/null | awk -v k="$2:" '$1==k {sub(/^[^:]*:[[:space:]]*/,""); print; exit}'
+}
+
+# --- build each package ---
+mapfile -t BUILD_PKGS < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' configs/build-list)
+[ "${#BUILD_PKGS[@]}" -gt 0 ] || fail "configs/build-list is empty"
+
+rm -rf "${ROOT_DIR}/bin/h5000m"
+mkdir -p "${ROOT_DIR}/bin/h5000m"
+
+declare -a LOCK_ROWS=()
+for pkg in "${BUILD_PKGS[@]}"; do
+  echo ">> building package/${pkg}"
+  ( cd "${SDK}" && make "package/${pkg}/clean" >/dev/null 2>&1 || true )
+  ( cd "${SDK}" && make "package/${pkg}/compile" V=s ) || fail "build failed: ${pkg}"
+
+  # locate the freshly built .apk (noarch packages live under the h5000m feed dir)
+  mapfile -t built < <(find "${SDK}/bin" -type f -name "${pkg}-*.apk")
+  [ "${#built[@]}" -eq 1 ] || fail "expected exactly one .apk for ${pkg}, found ${#built[@]}"
+  apkf="${built[0]}"
+
+  # magic
+  magic="$(dd if="${apkf}" bs=1 count=4 2>/dev/null)"
+  [ "${magic}" = "ADBd" ] || fail "${pkg}: bad container magic '${magic}' (want ADBd)"
+
+  # positive verify (capture status directly; never through a pipe)
+  if ! "${APK}" verify --keys-dir "${TRUST_DIR}" "${apkf}" >/dev/null 2>&1; then
+    fail "${pkg}: apk verify against our trust dir failed (unsigned or wrong key?)"
+  fi
+  # negative control: empty keys-dir MUST reject
+  if "${APK}" verify --keys-dir "${EMPTY_DIR}" "${apkf}" >/dev/null 2>&1; then
+    fail "${pkg}: apk verify unexpectedly PASSED with an empty keys-dir"
+  fi
+
+  name="$(apk_field "${apkf}" name)"
+  version="$(apk_field "${apkf}" version)"
+  arch="$(apk_field "${apkf}" arch)"
+  [ -n "${name}" ] && [ -n "${version}" ] || fail "${pkg}: could not read name/version from ${apkf}"
+  [ "${arch}" = "noarch" ] || fail "${pkg}: arch is '${arch}', expected noarch (PKGARCH:=all)"
+
+  cp "${apkf}" "${ROOT_DIR}/bin/h5000m/"
+  sha="$(file_sha256 "${apkf}")"
+  LOCK_ROWS+=("${name}	${version}	${arch}	${sha}	custom")
+  echo "   ${name} ${version} ${arch} signed+verified (${sha})"
+done
+
+# --- signed index over our feed ---
+echo ">> make package/index (signed packages.adb)"
+( cd "${SDK}" && make package/index ) || fail "package/index failed"
+index="$(find "${SDK}/bin/packages" -type f -path '*/h5000m/packages.adb' | head -1)"
+[ -n "${index}" ] || fail "no h5000m/packages.adb produced by package/index"
+imagic="$(dd if="${index}" bs=1 count=4 2>/dev/null)"
+[ "${imagic}" = "ADBd" ] || fail "packages.adb bad magic '${imagic}'"
+"${APK}" verify --keys-dir "${TRUST_DIR}" "${index}" >/dev/null 2>&1 || fail "signed index failed verification"
+cp "${index}" "${ROOT_DIR}/bin/h5000m/"
+echo "   index verified: ${index}"
+
+# --- kernel/abi provenance (noarch-independent; from the base artifact when available) ---
+kernel="noarch-independent"; kernel_abi="noarch-independent"
+base_info="${H5000M_BASE_ARTIFACT:-}/BUILD-INFO.txt"
+if [ -n "${H5000M_BASE_ARTIFACT:-}" ] && [ -f "${base_info}" ]; then
+  kernel="$(sed -n 's/^kernel=//p' "${base_info}")"
+  kernel_abi="$(sed -n 's/^kernel_abi=//p' "${base_info}")"
+fi
+
+# --- regenerate packages.lock ---
+new_lock="$(mktemp)"
+{
+  echo "# Resolved APK closure built from this repo. Regenerated by build-packages.sh."
+  echo "# revision=${revision} kernel=${kernel} kernel_abi=${kernel_abi}"
+  echo "# feeds_lock_sha256=${feeds_lock_sha} key_fingerprint=${configured_fpr}"
+  echo "# columns: name  version  arch  sha256  source"
+  printf '%s\n' "${LOCK_ROWS[@]}" | sort
+} > "${new_lock}"
+
+if [ "${CHECK}" -eq 1 ]; then
+  if ! diff -u configs/packages.lock "${new_lock}"; then
+    rm -f "${new_lock}"
+    fail "--check: regenerated packages.lock differs from the committed one"
+  fi
+  rm -f "${new_lock}"
+  echo ">> --check OK: committed packages.lock matches the rebuilt closure"
+else
+  mv "${new_lock}" configs/packages.lock
+  echo ">> wrote configs/packages.lock"
+fi
+echo ">> OK: built ${#BUILD_PKGS[@]} package(s), all signed + verified"

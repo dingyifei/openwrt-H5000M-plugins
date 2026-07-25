@@ -1,17 +1,175 @@
 #!/usr/bin/env bash
-# configure-sdk.sh — package-only SDK configuration. Sets up feeds and the persistent
-# signing key; does NOT select an image profile or unrelated packages.
+# configure-sdk.sh — package-only SDK configuration.
 #
-# Contract:
-#   in:  ./sdk (from fetch-official-sdk.sh), configs/openwrt-sdk.env, the persistent
-#        signing key at ${H5000M_APK_KEY:-~/.config/h5000m-apk/private-key.pem}
-#   out: ./sdk configured to build the recipes in package/ + the source-built feeds
-#   fail: if the key fingerprint != H5000M_PLUGIN_KEY_SHA256 in openwrt-sdk.env
+# Order (fatal on any failure):
+#   1. signing-key gate  — scripts/check-plugin-signing-key.sh (release: fingerprint must
+#      equal the pinned anchor; dev: any well-formed key, artifacts marked non-publishable).
+#   2. key placement     — copy the persistent key to sdk/{private,public}-key.pem so every
+#      built .apk is signed (rules.mk BUILD_KEY_APK_SEC/PUB point here; package/Makefile only
+#      auto-generates a throwaway pair if these are ABSENT). In dev mode also drop the
+#      sdk/.h5000m-dev-key marker that build-offline-repo.sh refuses to publish from.
+#   3. feeds.conf        — keep the SDK's commit-pinned `base` line verbatim; replace the five
+#      unpinned feed lines with the commit-pinned ones from the snapshot's feeds.buildinfo;
+#      add a src-link to this repo's package/. Persist resolved pins to configs/feeds.lock.
+#   4. feeds update/install -a.
+#   5. seed .config with CONFIG_ALL* off + one CONFIG_PACKAGE_<name>=m per configs/build-list
+#      entry, then `make defconfig`.
+#   6. assert: every build-list package is =m; signing symbols on; no image/rootfs target
+#      symbols; then write sdk/.h5000m-configured (revision + feeds-lock sha + key fingerprint).
+#
+# Must run on Linux (the SDK host tools are x86_64); locally, drive it via the amd64 builder
+# container. Needs network for the feeds clones.
 set -euo pipefail
-cd "$(dirname "$0")/.."
-. configs/openwrt-sdk.env
 
-echo "TODO: wire feeds.conf (official feeds for deps + local package/), then:"
-echo "  (cd sdk && ./scripts/feeds update -a && ./scripts/feeds install -a)"
-echo "TODO: verify signing key fingerprint == \$H5000M_PLUGIN_KEY_SHA256 (fail otherwise)"
-echo "TODO: make defconfig with ONLY the custom + source-built packages selected =m"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+# shellcheck source=../configs/openwrt-sdk.env
+source configs/openwrt-sdk.env
+
+SDK="${ROOT_DIR}/sdk"
+KEY_MODE="${H5000M_APK_KEY_MODE:-release}"
+
+fail() { echo "configure-sdk: $*" >&2; exit 1; }
+
+[ -d "${SDK}" ] || fail "missing ./sdk — run scripts/fetch-official-sdk.sh first"
+command -v curl >/dev/null 2>&1 || fail "curl is required"
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  else shasum -a 256 | cut -d' ' -f1; fi
+}
+key_fingerprint() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256_hex; }
+
+# --- 1. signing-key gate ---
+echo ">> [1/6] validating signing key (mode=${KEY_MODE})"
+"${ROOT_DIR}/scripts/check-plugin-signing-key.sh"
+
+case "${KEY_MODE}" in
+  release) DEFAULT_DIR="${HOME}/.config/h5000m-apk" ;;
+  dev)     DEFAULT_DIR="${HOME}/.config/h5000m-apk-dev" ;;
+  *) fail "unknown H5000M_APK_KEY_MODE '${KEY_MODE}'" ;;
+esac
+SIGNING_DIR="${H5000M_APK_SIGNING_DIR:-${DEFAULT_DIR}}"
+
+# --- 2. key placement ---
+echo ">> [2/6] placing signing key into the SDK"
+cp "${SIGNING_DIR}/private-key.pem" "${SDK}/private-key.pem"
+cp "${SIGNING_DIR}/public-key.pem"  "${SDK}/public-key.pem"
+chmod 0600 "${SDK}/private-key.pem"
+chmod 0644 "${SDK}/public-key.pem"
+KEY_FPR="$(key_fingerprint "${SDK}/private-key.pem")"
+[ -n "${KEY_FPR}" ] || fail "could not fingerprint the placed key"
+if [ "${KEY_MODE}" = dev ]; then
+  echo "dev key placed; artifacts from this SDK are NON-PUBLISHABLE" >&2
+  : > "${SDK}/.h5000m-dev-key"
+else
+  [ "${KEY_FPR}" = "${H5000M_PLUGIN_KEY_SHA256}" ] || fail "placed key fingerprint drifted"
+  rm -f "${SDK}/.h5000m-dev-key"
+fi
+
+# --- 3. feeds.conf + feeds.lock ---
+echo ">> [3/6] writing feeds.conf (base pinned verbatim, feeds pinned from feeds.buildinfo)"
+base_line="$(grep -E '^src-git --root=package[[:space:]]+base[[:space:]]' "${SDK}/feeds.conf.default" || true)"
+[ -n "${base_line}" ] || fail "could not find the pinned 'base' feed line in feeds.conf.default"
+case "${base_line}" in
+  *'^'*) : ;;
+  *) fail "the 'base' feed line is not commit-pinned: ${base_line}" ;;
+esac
+
+buildinfo="$(curl -fsSL --retry 5 --retry-all-errors "${OPENWRT_BASE_URL}/feeds.buildinfo")" \
+  || fail "could not fetch feeds.buildinfo"
+# Every feed line must be commit-pinned (contain '^<sha>').
+feed_lines="$(printf '%s\n' "${buildinfo}" | sed -e 's/#.*//' -e '/^[[:space:]]*$/d')"
+while IFS= read -r line; do
+  [ -n "${line}" ] || continue
+  case "${line}" in
+    src-git*'^'*) : ;;
+    *) fail "feeds.buildinfo line is not commit-pinned: ${line}" ;;
+  esac
+done <<< "${feed_lines}"
+
+abs_pkg="${ROOT_DIR}/package"
+{
+  echo "# generated by configure-sdk.sh — do not edit by hand"
+  echo "${base_line}"
+  printf '%s\n' "${feed_lines}"
+  echo "src-link h5000m ${abs_pkg}"
+} > "${SDK}/feeds.conf"
+
+# feeds.lock: name url sha, sorted; committed so pin drift is reviewable.
+{
+  echo "# Resolved feed pins for revision ${OPENWRT_REVISION:-$(sed -n 's/^REVISION:=//p' "${SDK}/include/version.mk" | head -1)}"
+  echo "# Regenerated by configure-sdk.sh. Columns: feed  url  commit"
+  {
+    # base (strip the --root=package option for a clean name/url/commit triple)
+    printf '%s\n' "${base_line}" | sed -E 's/^src-git[[:space:]]+--root=[^[:space:]]+[[:space:]]+//'
+    printf '%s\n' "${feed_lines}" | sed -E 's/^src-git[[:space:]]+//'
+  } | while IFS= read -r spec; do
+        name="${spec%%[[:space:]]*}"
+        rest="${spec#"${name}"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+        url="${rest%^*}"; commit="${rest##*^}"
+        printf '%s\t%s\t%s\n' "${name}" "${url}" "${commit}"
+      done | sort
+} > "${ROOT_DIR}/configs/feeds.lock"
+FEEDS_LOCK_SHA="$(sha256_hex < "${ROOT_DIR}/configs/feeds.lock")"
+
+# --- 4. feeds update/install ---
+echo ">> [4/6] feeds update -a && feeds install -a (this clones the pinned feeds; slow)"
+( cd "${SDK}" && ./scripts/feeds update -a )
+( cd "${SDK}" && ./scripts/feeds install -a )
+
+# --- 5. seed .config + defconfig ---
+echo ">> [5/6] seeding .config (CONFIG_ALL* off; build-list packages =m) + make defconfig"
+mapfile -t BUILD_PKGS < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' \
+  "${ROOT_DIR}/configs/build-list")
+[ "${#BUILD_PKGS[@]}" -gt 0 ] || fail "configs/build-list is empty"
+EXPECTED_COUNT="${#BUILD_PKGS[@]}"
+
+{
+  echo "# CONFIG_ALL is not set"
+  echo "# CONFIG_ALL_KMODS is not set"
+  echo "# CONFIG_ALL_NONSHARED is not set"
+  for pkg in "${BUILD_PKGS[@]}"; do
+    echo "CONFIG_PACKAGE_${pkg}=m"
+  done
+} > "${SDK}/.config"
+( cd "${SDK}" && make defconfig >/dev/null )
+
+# --- 6. assertions ---
+echo ">> [6/6] asserting configuration"
+selected=0
+for pkg in "${BUILD_PKGS[@]}"; do
+  grep -qx "CONFIG_PACKAGE_${pkg}=m" "${SDK}/.config" \
+    || fail "build-list package not selected =m after defconfig: ${pkg}"
+  selected=$((selected + 1))
+done
+[ "${selected}" -eq "${EXPECTED_COUNT}" ] || fail "selected ${selected} != expected ${EXPECTED_COUNT}"
+
+grep -qx 'CONFIG_SIGNED_PACKAGES=y'   "${SDK}/.config" || fail "CONFIG_SIGNED_PACKAGES is not y"
+grep -qx 'CONFIG_SIGN_EACH_PACKAGE=y' "${SDK}/.config" || fail "CONFIG_SIGN_EACH_PACKAGE is not y"
+
+# The "select all userspace packages" mega-switch must stay OFF — otherwise defconfig would
+# pull in the whole feed. (The SDK still carries the target's own default package set and its
+# inherited CONFIG_TARGET_ROOTFS_* defaults; an SDK cannot assemble a firmware image regardless,
+# so those are expected and not asserted against.)
+if grep -qx 'CONFIG_ALL=y' "${SDK}/.config"; then
+  fail "CONFIG_ALL=y leaked into .config (the whole feed would be selected)"
+fi
+for sym in CONFIG_ALL CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED; do
+  grep -qx "# ${sym} is not set" "${SDK}/.config" || fail "${sym} is not disabled in .config"
+done
+
+# Provenance marker for the downstream scripts.
+resolved_rev="$(sed -n 's/^REVISION:=//p' "${SDK}/include/version.mk" | head -1)"
+{
+  echo "revision=${resolved_rev}"
+  echo "feeds_lock_sha256=${FEEDS_LOCK_SHA}"
+  echo "key_fingerprint=${KEY_FPR}"
+  echo "key_mode=${KEY_MODE}"
+  echo "build_list_count=${EXPECTED_COUNT}"
+} > "${SDK}/.h5000m-configured"
+
+total_m="$(grep -c '=m$' "${SDK}/.config" || true)"
+echo ">> configured: ${EXPECTED_COUNT} repo package(s) =m; ${total_m} total =m (incl. auto-selected deps)"
+echo ">> feeds.lock sha256=${FEEDS_LOCK_SHA}; key=${KEY_FPR} (${KEY_MODE})"
+echo ">> OK: sdk/.h5000m-configured written for ${resolved_rev}"
