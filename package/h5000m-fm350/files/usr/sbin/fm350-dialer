@@ -87,18 +87,34 @@ deactivate_all() {
 	sleep 2
 }
 
-# activate <apn> -> echoes the aid the MODEM chose
+# activate <apn> <apn_type> -> echoes the aid the MODEM chose
 #
 # +EAPNACT rather than +CGACT: it activates by APN name and type, lets the modem pick the
 # aid, and never returns the local refusal 5847. AT+CGACT=1,1 cannot succeed where the
 # carrier owns cid 1 for IMS (China Telecom does), and no amount of CFUN cycling changes
 # that - the refusal is local, confirmed by AT+CEER reporting no network cause at all.
 activate() {
-	_out=$(at "AT+EAPNACT=1,\"$1\",\"${APN_TYPE}\"" 45)
+	_out=$(at "AT+EAPNACT=1,\"$1\",\"$2\"" 45)
 	# Success is the URC, not OK: "+CGEV: ME PDN ACT <aid>,<n>".
 	_aid=$(printf '%s' "$_out" | sed -n 's/.*ME PDN ACT \([0-9]*\).*/\1/p' | head -1)
 	[ -n "$_aid" ] || return 1
 	printf '%s' "$_aid"
+}
+
+# The APN TYPE the modem will accept is NOT stable, which cost a debugging round.
+# Measured on this unit, same SIM, same carrier, ~an hour apart:
+#   session 1: type "default" activated cleanly.
+#   session 2: type "default" -> +CME ERROR 5848 with NOTHING active, while "net"
+#              activated immediately -> +CGEV: ME PDN ACT 3,2.
+# Both refusals are local: AT+CEER reported "+CEER: 0,NONE", i.e. no network cause at all,
+# and a CFUN=4/CFUN=1 cycle did not change the outcome. A local refusal that carries no
+# reason cannot be predicted, only probed - so try the configured type first, then the
+# others, rather than failing the whole bring-up on one type's refusal.
+apn_type_ladder() {
+	printf '%s\n' "$APN_TYPE"
+	for _t in default net tethering; do
+		[ "$_t" = "$APN_TYPE" ] || printf '%s\n' "$_t"
+	done
 }
 
 apn_from_table() {
@@ -208,9 +224,15 @@ for attempt in blank table manual; do
 		        log "blank APN did not activate; trying IMSI table entry '$try_apn'" ;;
 		manual) [ -n "$APN" ] || continue; try_apn="$APN" ;;
 	esac
-	AID=$(activate "$try_apn")
-	[ -n "$AID" ] && { log "activated apn='${try_apn:-<subscription default>}' aid=${AID}"; break; }
-	AID=""
+	for try_type in $(apn_type_ladder); do
+		AID=$(activate "$try_apn" "$try_type")
+		[ -n "$AID" ] && break
+		AID=""
+	done
+	[ -n "$AID" ] && {
+		log "activated apn='${try_apn:-<subscription default>}' type=${try_type} aid=${AID}"
+		break
+	}
 	deactivate_all
 done
 

@@ -77,11 +77,28 @@ if [ -r "$ATIO" ]; then
 	fi
 fi
 
+# ⚠️ /usr/bin/lpac is NOT the lpac binary - OpenWrt's lpac package ships a UCI wrapper
+# there, and the real binary is /usr/lib/lpac. The wrapper does:
+#     APDU_BACKEND="$(uci_get lpac global apdu_backend uqmi)"
+#     export LPAC_APDU="$APDU_BACKEND"
+# i.e. it UNCONDITIONALLY OVERWRITES LPAC_APDU from UCI, whose default is 'uqmi'. So
+# exporting LPAC_APDU=at here and calling `lpac` silently got us the uqmi backend pointed
+# at /dev/cdc-wdm0 - a device this modem does not have - and the only symptom was
+# "Failed to open device". The wrapper's AT branch is no better: it reads
+# `uci_get lpac at device /dev/ttyUSB2`, a hard-coded node that is wrong on this unit
+# (our AT port is interface 6) and would break again on re-enumeration anyway.
+#
+# So call the real binary directly and keep our environment authoritative. Falling back to
+# `lpac` if /usr/lib/lpac is absent covers a future package layout change.
+LPAC_BIN=/usr/lib/lpac
+[ -x "$LPAC_BIN" ] || LPAC_BIN="$(command -v lpac)"
+export LPAC_BIN
+
 # Hand the leased AT port to lpac. at-lease exports MODEM_AT_B into our child; bind the
 # lpac AT backend to it unless the caller already chose a device/backend. The inner
 # positional args are the user's lpac arguments ($0 is a label only).
 exec at-lease sh -c '
 	export LPAC_APDU="${LPAC_APDU:-at}"
 	export LPAC_APDU_AT_DEVICE="${LPAC_APDU_AT_DEVICE:-$MODEM_AT_B}"
-	exec lpac "$@"
+	exec "$LPAC_BIN" "$@"
 ' lpac "$@"
