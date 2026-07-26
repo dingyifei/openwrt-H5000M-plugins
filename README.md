@@ -63,14 +63,51 @@ tests/                 # mocked-UCI / state-machine / package tests
    official packages), with checksums/provenance/install instructions.
 5. `scripts/verify-offline-install.sh` — install into the exact base artifact, network cut.
 
-## Status
+## Status — ✅ pipeline working, milestone M1 verified (2026-07-26)
 
-**Rolling model** (chosen 2026-07-25). No SDK/feed pinning or off-machine tarball
-preservation: `scripts/fetch-official-sdk.sh` fetches the current SDK from the live mirror
-and integrity-checks it against the mirror's own `sha256sums`. The base is built in
-`OPENWRT_ROLLING=1` mode; **build the base and these plugins from the same snapshot in one
-run** so kmods/deps agree (this feature set builds no kmods, so ABI risk is minimal).
+The full chain is implemented and **proven against the real base image**
+(`r35533-3b2bc55dcb`, kernel 6.18.39):
 
-Next: implement `configure-sdk.sh` / `build-packages.sh` against the fetched SDK, and pin
-the first source-built package (luci-app-epm or PassWall2) in `configs/sources.lock`
-(external *source* pins still matter — only the OpenWrt snapshot itself rolls).
+```
+INSTALL (network cut, no --allow-untrusted)
+  (1/5) iwinfo  (2/5) rpcd-mod-rpcsys  (3/5) travelmate
+  (4/5) luci-app-travelmate            (5/5) h5000m-travelmate-defaults
+POSITIVE OK: closure matches; anchors only
+NEGATIVE CONTROLS (each must fail)
+  [PASS] empty keys-dir · [PASS] corrupted .apk
+  [PASS] untrusted signer · [PASS] absent package     (4/4)
+M1 VERIFICATION PASSED
+```
+
+Our signed package installs alongside OpenWrt-signed packages into the exact base rootfs,
+offline, using only the firmware's embedded trust anchors — and the trust checks are
+demonstrably real, not decorative.
+
+**Rolling model** (chosen 2026-07-25). No SDK/feed pinning or tarball preservation:
+`fetch-official-sdk.sh` pulls the current SDK and checks it against the mirror's own
+`sha256sums`; `configure-sdk.sh` pins the 5 feeds per-run from the snapshot's
+`feeds.buildinfo` (the `base` feed is already commit-pinned in `feeds.conf.default`).
+**Build the base and these plugins from the same snapshot in one run** so kmods/deps agree
+(this feature set builds no kmods, so ABI risk is minimal).
+
+Verified apk behaviour — including the gotcha that a *relative* `--keys-dir` silently
+reports everything `UNTRUSTED` — is in [`docs/apk-tooling-findings.md`](docs/apk-tooling-findings.md).
+
+### Usage
+
+```sh
+./scripts/fetch-official-sdk.sh                              # fetch + verify the SDK
+./scripts/build-in-container.sh scripts/configure-sdk.sh     # feeds, key gate, seeded .config
+./scripts/build-in-container.sh scripts/build-packages.sh    # build + sign + verify
+export H5000M_BASE_ARTIFACT=../openwrt-H5000M/artifacts/H5000M-official-base-<rev>
+./scripts/build-in-container.sh --mount-base scripts/build-offline-repo.sh travelmate
+./scripts/build-in-container.sh --network none --mount-base \
+    scripts/verify-offline-install.sh travelmate             # M1 gate
+```
+
+### Next
+
+Add feature sets (Tailscale, FM350, mwan3) to `configs/feature-sets.conf` plus their glue
+packages — each is now a config edit rather than new machinery. Third-party source builds
+(`luci-app-epm`, PassWall2) remain deferred; `configs/sources.lock` is empty and
+`build-packages.sh` fails loudly if it is not.
