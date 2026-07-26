@@ -79,5 +79,5 @@ network.registerProtocol('fm350', {
 		o = s.taboption('advanced', form.Value, 'mtu', _('Override MTU'));
 		o.datatype = 'max(9200)';
 		o.placeholder = _('(from the network)');
-
+	}
 });
