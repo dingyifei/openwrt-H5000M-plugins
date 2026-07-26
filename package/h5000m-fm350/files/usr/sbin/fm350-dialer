@@ -169,20 +169,42 @@ publish() {
 	log "published ${_ip}/24 gw ${_ip%.*}.1 aid ${AID} dev ${MODEM_NETDEV}"
 }
 
-at_state_load || modem_discover_locked || {
-	warn "no FM350 on the USB bus"
-	proto_notify_error "$INTERFACE" NO_MODEM
-	proto_block_restart "$INTERFACE"
-	exit 1
-}
-at_state_load
-
-[ -n "$MODEM_NETDEV" ] || {
-	warn "no RNDIS netdev - is kmod-usb-net-rndis installed?"
-	proto_notify_error "$INTERFACE" NO_NETDEV
-	proto_block_restart "$INTERFACE"
-	exit 1
-}
+# WAIT for the modem rather than giving up on the first miss.
+#
+# The FM350 is a computer running its own firmware and it reboots itself - measured: a
+# USB control transfer returned -110 (ETIMEDOUT), every ttyUSB node vanished, and ~90s
+# later all seven nodes plus the RNDIS netdev came back with no host-side involvement at
+# all. It also comes up strictly LATER than the USB bus does, so at boot there is a window
+# where the interfaces enumerate but nothing answers AT yet. That window is real: a boot
+# left "no AT port responded on 2-1" in the log exactly once and then never retried, so
+# cellular stayed down until a human intervened.
+#
+# A one-shot probe therefore fails for a modem that is merely busy booting. Poll instead,
+# and only give up - and only then block restarts - once the modem has genuinely not
+# appeared for two minutes.
+#
+# The sleep is what makes this safe against the respawn storm: netifd restarts a proto
+# command that exits, so failing FAST is the dangerous behaviour here, not failing slowly.
+MODEM_WAIT=120
+_md_end=$(( $(date +%s) + MODEM_WAIT ))
+while :; do
+	at_state_load && [ -n "$MODEM_NETDEV" ] && break
+	modem_discover_locked >/dev/null 2>&1
+	at_state_load && [ -n "$MODEM_NETDEV" ] && break
+	if [ "$(date +%s)" -ge "$_md_end" ]; then
+		if at_state_load; then
+			warn "AT port found but no RNDIS netdev after ${MODEM_WAIT}s - is kmod-usb-net-rndis installed?"
+			proto_notify_error "$INTERFACE" NO_NETDEV
+		else
+			warn "no FM350 on the USB bus after ${MODEM_WAIT}s"
+			proto_notify_error "$INTERFACE" NO_MODEM
+		fi
+		proto_block_restart "$INTERFACE"
+		exit 1
+	fi
+	log "waiting for the modem to finish coming up"
+	sleep 10
+done
 
 at 'AT+CMEE=2' 6 >/dev/null 2>&1
 case "$(at 'AT+CPIN?' 8)" in
