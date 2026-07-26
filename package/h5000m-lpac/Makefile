@@ -18,7 +18,8 @@ define Package/h5000m-lpac
   TITLE:=H5000M eSIM (lpac) wrapper
   # lpac supplies the eUICC CLI; h5000m-modem-atd supplies at-lease + the AT port
   # discovery/lock this wrapper leases the port through.
-  DEPENDS:=+h5000m-modem-atd +lpac
+  DEPENDS:=+h5000m-modem-atd
+  EXTRA_DEPENDS:=lpac (>=0)
   PKGARCH:=all
 endef
 

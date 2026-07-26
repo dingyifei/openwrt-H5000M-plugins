@@ -58,8 +58,15 @@ mapfile -t FEATURE_PKGS < <(awk -v want="[${FEATURE_SET}]" '
 ' configs/feature-sets.conf)
 [ "${#FEATURE_PKGS[@]}" -gt 0 ] || fail "feature set '${FEATURE_SET}' not found / empty in configs/feature-sets.conf"
 
-# names of our own packages (so we never demux them into official/)
-mapfile -t OUR_NAMES < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' configs/packages.lock | awk '{print $1}')
+# Names of our own packages, so we never demux them into official/.
+#
+# Sourced from configs/build-list, NOT configs/packages.lock: this script APPENDS the
+# official half of the closure to the lock, so on any run after the first the lock also
+# contains upstream names. Reading it back here made is_ours() claim upstream packages
+# (464xlat, the kmods, ...) as ours and then look for them in bin/h5000m/, where they
+# obviously are not. build-list is by definition exactly what we build.
+mapfile -t OUR_NAMES < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' \
+  configs/build-list)
 is_ours() { local n="$1"; for o in "${OUR_NAMES[@]}"; do [ "$n" = "$o" ] && return 0; done; return 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
@@ -134,7 +141,29 @@ done
 
 # assemble the tree
 rm -rf "${OUT}"; mkdir -p "${OUT}/h5000m"
-cp -a "${ROOT_DIR}/bin/h5000m/." "${OUT}/h5000m/"
+# Ship our signed index verbatim, but ONLY the .apk files this feature set actually
+# resolves to. bin/h5000m/ holds every package we build; copying all of them made the
+# offline repo advertise a closure larger than the requested set, which
+# verify-offline-install then correctly rejected (installed != repo contents). The index
+# stays a superset - it lists everything we build - which is fine and already verified:
+# apk resolves against the index and only needs the .apk files it installs to be present.
+cp "${ROOT_DIR}/bin/h5000m/packages.adb" "${OUT}/h5000m/packages.adb"
+
+# Which of OUR packages does this feature set actually resolve to?
+#
+# NOT from the download cache: apk only caches what it fetches over the network, and our
+# repo is a local file, so our packages never appear there (the run above reported
+# "11 package(s) fetched" for a 13-package closure). The authoritative answer is the
+# resolved install database in the staged rootfs.
+while IFS=' ' read -r n v; do
+  [ -n "${n}" ] || continue
+  is_ours "${n}" || continue
+  src="${ROOT_DIR}/bin/h5000m/${n}-${v}.apk"
+  [ -f "${src}" ] || fail "closure needs ${n} ${v} but ${src} is missing"
+  cp "${src}" "${OUT}/h5000m/${n}-${v}.apk"
+  echo ">> shipping our package ${n} ${v}"
+done < <(awk '/^P:/{p=substr($0,3)} /^V:/{if (p!="") {print p" "substr($0,3); p=""}}' \
+  "${STAGE}/lib/apk/db/installed")
 
 declare -A USED_FEEDS
 apk_field() { "${APK}" adbdump "$1" 2>/dev/null | awk -v k="$2:" '$1==k {sub(/^[^:]*:[[:space:]]*/,""); print; exit}'; }
@@ -143,7 +172,8 @@ for apkf in "${CACHED[@]}"; do
   n="$(apk_field "${apkf}" name)"; v="$(apk_field "${apkf}" version)"
   [ -n "${n}" ] || fail "cached apk without a name: ${apkf}"
   if is_ours "${n}"; then
-    # our package is already present (byte-identical) under h5000m/ from the signed build
+    # Already placed above from bin/h5000m (the artifact build-packages.sh signed and
+    # verified). In practice ours never reach the cache at all - see the note above.
     continue
   fi
   feed="${FEED_OF["${n} ${v}"]:-}"

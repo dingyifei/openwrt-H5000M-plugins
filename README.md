@@ -126,16 +126,48 @@ hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -
 (busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
 credentials. It has been negative-controlled — injecting each violation makes it fail.
 
+### Build cost: why these packages use `EXTRA_DEPENDS`
+
+Our glue packages compile nothing — they are shell scripts in a tarball. But declaring a
+runtime dependency the obvious way, `DEPENDS:=+travelmate`, makes kconfig **`select`** that
+package, which makes the SDK **build it from source**: `tailscale` drags in a full Go
+toolchain build, `lpac` drags in `libmbim` → `gnutls` → `nettle` → `gmp`. All of it is then
+discarded, because what we actually ship is OpenWrt's official binary. That cost ~50
+minutes of CI and was the cause of the local `configure: error: cannot run /bin/bash
+./config.sub` failure — a toolchain problem in a dependency we never wanted built.
+
+`EXTRA_DEPENDS` writes the dependency straight into the package metadata at pack time
+(`include/package-pack.mk`) and never triggers a `select`. Measured: dependency compiles
+drop to **zero**.
+
+The catch, and the reason a first attempt failed: OpenWrt rejects unversioned entries with
+*"Extra dependencies must have version constraints"*. Reading the check, it is simply
+`$(word 2,...)` — it only asks that a second word exist, not that the constraint be
+meaningful. So `travelmate (>=0)` satisfies it while constraining nothing, which is what we
+want under a rolling snapshot. Note the **space before `(`** is mandatory; the same macro
+errors out without it. Precedent: `EXTRA_DEPENDS:=ucode (>=2022.03.22)` in `firewall4`.
+
+This trades a compile-time guarantee for an install-time one, so the closure is no longer
+proven by the build — it is proven by `verify-offline-install.sh`, which resolves the real
+closure into the actual rootfs with `--network none` and asserts it equals
+`configs/packages.lock`. If the metadata were wrong, that gate fails.
+
 ### Known-good vs not-yet-proven
 
 - ✅ Proven on hardware: AT discovery, `atq`/denylist, APN programming, proto registration,
   Travelmate/Tailscale uci-defaults (idempotent over three runs, `fw4 check` clean).
-- ⚠️ **The full SDK build of the cellular closure is not yet green locally.** Selecting a
-  package with `DEPENDS:=+<in-feed pkg>` makes the SDK build that dependency from source,
-  and the local (macOS/Docker) toolchain fails part-way through that chain with
-  `configure: error: cannot run /bin/bash ./config.sub`. `EXTRA_DEPENDS` is not a way out:
-  OpenWrt rejects it unless every entry carries a version constraint, which is unworkable
-  under a rolling snapshot. CI on a native Linux runner is the arbiter.
+- ✅ **All six packages build and the cellular closure verifies end to end.** With
+  `EXTRA_DEPENDS` the dependency source-builds vanish: each package compiles in 5-10s, and
+  the `config.sub` toolchain failure went away with the chain that caused it.
+  `verify-offline-install.sh cellular` installs the full 13-package closure - including the
+  ABI-locked kmods, `464xlat`, `kmod-nat46` and `coreutils-stty` - into the exact base
+  rootfs with `--network none` and no `--allow-untrusted`, all 4 negative controls failing
+  as required.
+- ⚠️ **`EXTRA_DEPENDS` names are not validated at build time.** They are a free-form
+  string, so a typo (`travelmatee (>=0)`) builds cleanly and only fails at install. The
+  only thing that catches it is `verify-offline-install.sh` - and only for feature sets we
+  actually verify. **Verify the `all` set in CI** so every package's dependencies are
+  exercised, or this hole stays open for the unverified ones.
 - ⛔ FM350 end-to-end attach is blocked by the **SIM**, not by code: the fitted SIM is
   refused by the network (`+CEREG: 0,3`, registration denied) even when forced to its home
   PLMN. Everything up to and including APN programming works.

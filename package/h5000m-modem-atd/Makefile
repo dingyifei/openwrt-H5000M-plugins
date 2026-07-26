@@ -21,7 +21,7 @@ define Package/h5000m-modem-atd
   # seven AT/diag ports are all ff/00/00, which upstream option.c claims explicitly
   # (option.c: USB_DEVICE_AND_INTERFACE_INFO(0x0e8d, 0x7127, 0xff, 0x00, 0x00)).
   # busybox has no stty, so coreutils-stty is required to put the port in raw mode.
-  DEPENDS:=+kmod-usb-serial-option +kmod-usb-net-rndis +coreutils-stty
+  EXTRA_DEPENDS:=kmod-usb-serial-option (>=0), kmod-usb-net-rndis (>=0), coreutils-stty (>=0)
   PKGARCH:=all
 endef
 

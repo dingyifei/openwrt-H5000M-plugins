@@ -18,7 +18,8 @@ define Package/h5000m-fm350
   # 464xlat + kmod-nat46 are NOT optional: the FM350's Intel XMM does not run CLAT
   # itself, so on an IPv6-only grant (T-Mobile US and friends) IPv4 is simply absent
   # unless the router provides it, which looks exactly like a wrong APN.
-  DEPENDS:=+h5000m-modem-atd +464xlat +kmod-nat46
+  DEPENDS:=+h5000m-modem-atd
+  EXTRA_DEPENDS:=464xlat (>=0), kmod-nat46 (>=0)
   PKGARCH:=all
 endef
 

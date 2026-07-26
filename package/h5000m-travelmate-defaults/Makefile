@@ -15,7 +15,7 @@ define Package/h5000m-travelmate-defaults
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=H5000M Travelmate defaults
-  DEPENDS:=+travelmate +luci-app-travelmate +wpad-openssl
+  EXTRA_DEPENDS:=travelmate (>=0), luci-app-travelmate (>=0), wpad-openssl (>=0)
   PKGARCH:=all
 endef
 

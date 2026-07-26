@@ -133,11 +133,19 @@ if ! diff -u "${expected}" "${delta}" >/dev/null; then
   diff -u "${expected}" "${delta}" >&2 || true
   fail "newly-installed set != offline-repo closure"
 fi
-# our built packages (configs/packages.lock) must be among the installed delta
-while IFS= read -r ourpkg; do
-  [ -n "${ourpkg}" ] || continue
-  grep -qx "${ourpkg}" "${delta}" || fail "our package ${ourpkg} was not installed"
-done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' configs/packages.lock | awk '{print $1}')
+# Every package of OURS that this feature set's offline repo ships must be installed.
+#
+# Deliberately scoped to the repo rather than to all of configs/packages.lock: the lock
+# records everything build-packages.sh built (all six packages), whereas a feature set
+# installs only its own closure. Asserting the whole lock would demand that verifying the
+# 'cellular' set also install the Tailscale and mwan3 glue - nonsense, and exactly what
+# broke once more than one package existed.
+while IFS= read -r ourapk; do
+  [ -n "${ourapk}" ] || continue
+  ourpkg="$(apk_name "${ourapk}")"
+  [ -n "${ourpkg}" ] || fail "could not read a package name from ${ourapk}"
+  grep -qx "${ourpkg}" "${delta}" || fail "our package ${ourpkg} was shipped but not installed"
+done < <(find "${OUT}/h5000m" -type f -name '*.apk' 2>/dev/null)
 
 note "POSITIVE OK: installed $(wc -l < "${delta}" | tr -d ' ') package(s); closure matches; anchors only"
 

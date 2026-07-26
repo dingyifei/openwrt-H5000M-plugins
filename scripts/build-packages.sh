@@ -75,11 +75,19 @@ mapfile -t BUILD_PKGS < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space
 rm -rf "${ROOT_DIR}/bin/h5000m"
 mkdir -p "${ROOT_DIR}/bin/h5000m"
 
+# Parallelism for any dependency the build system still decides to compile. Override with
+# H5000M_BUILD_JOBS. nproc is absent on macOS hosts, hence the sysctl fallback.
+: "${H5000M_BUILD_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
+
 declare -a LOCK_ROWS=()
 for pkg in "${BUILD_PKGS[@]}"; do
   echo ">> building package/${pkg}"
   ( cd "${SDK}" && make "package/${pkg}/clean" >/dev/null 2>&1 || true )
-  ( cd "${SDK}" && make "package/${pkg}/compile" V=s ) || fail "build failed: ${pkg}"
+  # -j: these packages compile nothing themselves, but any dependency the build system
+  # decides to build is otherwise done strictly serially. Keep V=s so a failure is still
+  # attributable; OpenWrt serialises the per-package steps that need it.
+  ( cd "${SDK}" && make -j"${H5000M_BUILD_JOBS}" "package/${pkg}/compile" V=s ) \
+    || fail "build failed: ${pkg}"
 
   # locate the freshly built .apk (noarch packages live under the h5000m feed dir)
   mapfile -t built < <(find "${SDK}/bin" -type f -name "${pkg}-*.apk")

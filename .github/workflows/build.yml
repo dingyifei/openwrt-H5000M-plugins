@@ -99,12 +99,12 @@ jobs:
       - name: Build signed offline repo
         if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
         env: { H5000M_BASE_ARTIFACT: "${{ steps.base.outputs.dir }}" }
-        run: sudo -E ./scripts/build-offline-repo.sh cellular
+        run: sudo -E ./scripts/build-offline-repo.sh all
 
       - name: Verify offline install into exact base
         if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
         env: { H5000M_BASE_ARTIFACT: "${{ steps.base.outputs.dir }}" }
-        run: sudo -E ./scripts/verify-offline-install.sh cellular
+        run: sudo -E ./scripts/verify-offline-install.sh all
 
       - name: Report skipped gates
         if: steps.base.outcome != 'success' || steps.key.outputs.mode != 'release'

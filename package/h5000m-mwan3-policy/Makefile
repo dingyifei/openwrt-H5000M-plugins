@@ -17,7 +17,7 @@ define Package/h5000m-mwan3-policy
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=H5000M mwan3 failover policy
-  DEPENDS:=+mwan3 +luci-app-mwan3
+  EXTRA_DEPENDS:=mwan3 (>=0), luci-app-mwan3 (>=0)
   PKGARCH:=all
 endef
 

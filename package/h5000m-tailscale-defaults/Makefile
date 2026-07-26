@@ -15,7 +15,7 @@ define Package/h5000m-tailscale-defaults
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=H5000M Tailscale defaults
-  DEPENDS:=+tailscale +kmod-tun +luci-app-tailscale-community
+  EXTRA_DEPENDS:=tailscale (>=0), kmod-tun (>=0), luci-app-tailscale-community (>=0)
   PKGARCH:=all
 endef
 
