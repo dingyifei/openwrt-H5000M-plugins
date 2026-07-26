@@ -23,10 +23,12 @@ jobs:
       - name: Static plugin invariants
         run: sh tests/test-plugin-invariants.sh
 
+      # These two are bash scripts (they use `set -o pipefail`); on ubuntu /bin/sh is
+      # dash, which rejects it. test-plugin-invariants.sh is POSIX and runs under sh.
       - name: Repo self-tests
         run: |
-          sh tests/test-check-secrets.sh
-          sh tests/test-plugin-signing-key.sh
+          bash tests/test-check-secrets.sh
+          bash tests/test-plugin-signing-key.sh
 
       - name: Secret scan
         run: ./scripts/check-secrets.sh
