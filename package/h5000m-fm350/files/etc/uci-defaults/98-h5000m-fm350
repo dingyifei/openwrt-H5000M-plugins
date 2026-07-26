@@ -17,18 +17,12 @@ if [ "$(uci -q get network.cellular)" != 'interface' ]; then
 	# rejected on others, which would turn a working attach into a failure.
 	uci -q set network.cellular.apn=''
 	uci -q set network.cellular.pdp_type='IPV4V6'
-	# PDP context 1 is a hardware constraint on this modem, not a preference: RNDIS
-	# forwards traffic only on the initial bearer. Any other context yields an IP and
-	# then silently drops every packet.
-	uci -q set network.cellular.pdp_index='1'
+	# The modem chooses the context id itself (+EAPNACT); the APN *type* is what selects
+	# the bearer RNDIS carries. 'default' is verified working on China Telecom.
+	uci -q set network.cellular.apn_type='default'
 	# Verified on this unit (firmware 81600.0000.00.29.21.24): AT+CGAUTH returns an
 	# error, so PAP/CHAP is simply not expressible on this modem.
 	uci -q set network.cellular.auth='none'
-	# Also verified: AT+EIAAPN is rejected by this firmware, so there is no separate
-	# initial-EPS-bearer APN knob and AT+CGDCONT=1 is the only lever. Left off to save
-	# a pointless round-trip and a misleading log line; set to 1 if a firmware update
-	# ever adds it.
-	uci -q set network.cellular.set_attach_apn='0'
 	# Lowest-priority uplink by default; mwan3 owns real failover ordering.
 	uci -q set network.cellular.metric='20'
 	uci -q set network.cellular.auto='0'

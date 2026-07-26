@@ -5,15 +5,13 @@
 # (correctly) treats a BEARER_ assignment as a possible bearer token, and a cellular
 # "bearer" is an unrelated meaning of the word.
 #
-# Contract with netifd: we publish the granted address with proto_send_update and then
-# stay alive, re-publishing whenever the network renumbers us. We never re-dial to
-# refresh an address, and we never exit just because one address family is missing.
+# Contract with netifd: publish the granted address with proto_send_update, then stay alive
+# and re-publish whenever the network renumbers us. An address change is a re-publish, never
+# a re-dial, and a single-family grant is a success.
 #
-# Deliberately NOT `set -u`: OpenWrt's own /lib/functions.sh dereferences $IPKG_INSTROOT
-# unset, so `set -u` kills this script the moment it is sourced. Because netifd respawns
-# a proto command that exits, that failure mode is not a one-off - it is an instant
-# restart storm (measured: dozens of respawns per second). Every variable below is
-# explicitly initialised instead.
+# Deliberately NOT `set -u`: OpenWrt's /lib/functions.sh dereferences $IPKG_INSTROOT unset,
+# which would kill this script on source - and netifd respawns a proto command that exits,
+# so that is a restart storm, not a one-off.
 
 . /lib/functions.sh
 . /lib/netifd/netifd-proto.sh
@@ -22,18 +20,16 @@
 
 APN_TABLE=/usr/lib/h5000m/apn-table
 
-INTERFACE=""; APN=""; PDP_TYPE="IPV4V6"; CID=1; METRIC=20; MTU=0
-SET_ATTACH=1; PEERDNS=1
+INTERFACE=""; APN=""; PDP_TYPE="IPV4V6"; APN_TYPE="default"; METRIC=20; MTU=0; PEERDNS=1
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-i) INTERFACE="$2"; shift 2 ;;
 		-a) APN="$2"; shift 2 ;;
 		-t) PDP_TYPE="$2"; shift 2 ;;
-		-c) CID="$2"; shift 2 ;;
+		-y) APN_TYPE="$2"; shift 2 ;;
 		-m) METRIC="$2"; shift 2 ;;
 		-u) MTU="$2"; shift 2 ;;
-		-e) SET_ATTACH="$2"; shift 2 ;;
 		-d) PEERDNS="$2"; shift 2 ;;
 		*) shift ;;
 	esac
@@ -45,39 +41,69 @@ echo $$ > "$PIDFILE"
 
 POLL_INTERVAL=30
 REPUBLISH=0
+AID=""
 LAST_IP=""
-LAST_IP6=""
 PDP_DOWN_STREAK=0
 BLACKHOLE=0
 LAST_TX=0
 LAST_RX=0
 
-log() { logger -t "fm350[$INTERFACE]" -p daemon.info "$*"; }
+log()  { logger -t "fm350[$INTERFACE]" -p daemon.info "$*"; }
 warn() { logger -t "fm350[$INTERFACE]" -p daemon.warn "$*"; }
 
 cleanup() { rm -f "$PIDFILE"; }
 trap cleanup EXIT
 trap 'REPUBLISH=1' USR1
 
-# --- AT plumbing ------------------------------------------------------------------
-# Every exchange takes the port lock. This modem exposes exactly ONE working AT port
-# (interface 6 / ttyUSB3; the other six ttyUSB nodes are silent), so the dialer cannot
-# own a port for its lifetime - it is a peer with lpac, atq and humans. The cost is
-# that URCs arriving while someone else holds the port are missed, which is why state
-# below is poll-authoritative and URCs are only an optimisation.
 at() {
 	at_locked "$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_A_IF")" 20 \
 		"$MODEM_AT_A" "$1" "${2:-8}"
 }
 
-# --- APN ladder -------------------------------------------------------------------
-# Blank first. A blank APN requests the subscription default, which 3GPP guarantees
-# exists, so it is self-correcting; a guessed APN is not. The table is consulted only
-# after blank has demonstrably failed, and there is deliberately no generic fallback.
+# --- address parsing --------------------------------------------------------------
+# AT+CGPADDR returns the IPv6 address as SIXTEEN dotted octets, which a naive [0-9.]+
+# pattern happily matches as though it were IPv4 - that silently cost a debugging round.
+# Select the value with exactly four octets.
+ipv4_of() {
+	at "AT+CGPADDR=$1" 8 | tr ',' '\n' | tr -d '" ' \
+		| awk -F. 'NF==4 && $1 != "" && $1 ~ /^[0-9]+$/ { print; exit }'
+}
+
+active_aids() {
+	at 'AT+CGACT?' 8 | sed -n 's/.*+CGACT: *\([0-9]*\), *1.*/\1/p'
+}
+
+# --- bring-up ---------------------------------------------------------------------
+# EXACTLY ONE context may be active. This is the real constraint - not the cid number.
+# With two or more live, RNDIS forwards none of them: tx climbs and rx stays at zero.
+# Verified by deactivating everything and activating one, which made the very same address
+# and route start working. It also explains why "use cid 1" worked for some reporters and
+# not others, depending on what else happened to be active at the time.
+deactivate_all() {
+	for _a in $(active_aids); do
+		log "deactivating aid ${_a} (only one context may be active)"
+		at "AT+EAPNACT=0,${_a}" 20 >/dev/null 2>&1
+	done
+	sleep 2
+}
+
+# activate <apn> -> echoes the aid the MODEM chose
+#
+# +EAPNACT rather than +CGACT: it activates by APN name and type, lets the modem pick the
+# aid, and never returns the local refusal 5847. AT+CGACT=1,1 cannot succeed where the
+# carrier owns cid 1 for IMS (China Telecom does), and no amount of CFUN cycling changes
+# that - the refusal is local, confirmed by AT+CEER reporting no network cause at all.
+activate() {
+	_out=$(at "AT+EAPNACT=1,\"$1\",\"${APN_TYPE}\"" 45)
+	# Success is the URC, not OK: "+CGEV: ME PDN ACT <aid>,<n>".
+	_aid=$(printf '%s' "$_out" | sed -n 's/.*ME PDN ACT \([0-9]*\).*/\1/p' | head -1)
+	[ -n "$_aid" ] || return 1
+	printf '%s' "$_aid"
+}
+
 apn_from_table() {
 	_imsi=$(at 'AT+CIMI' 6 | tr -dc '0-9')
 	[ -n "$_imsi" ] || return 1
-	# Try 6-digit MCC+MNC3 first, then 5-digit MCC+MNC2.
 	for _len in 6 5; do
 		_key=$(printf '%s' "$_imsi" | cut -c1-"$_len")
 		_hit=$(awk -v k="$_key" '$1==k {print $2; exit}' "$APN_TABLE" 2>/dev/null)
@@ -86,169 +112,33 @@ apn_from_table() {
 	return 1
 }
 
-# program_apn <apn> - set the context and, where supported, the initial EPS bearer.
-#
-# On LTE/5G the APN that governs ATTACH is the initial EPS bearer, not CID 1, so
-# AT+CGDCONT alone may not influence it; on Fibocom that knob is documented as
-# AT+EIAAPN. Verified on this unit, however, AT+EIAAPN returns +CME ERROR - it does not
-# exist on firmware 81600.0000.00.29.21.24 - so CGDCONT is in practice the only lever
-# here. The call is kept, guarded and non-fatal, for firmwares that do implement it.
-program_apn() {
-	_apn="$1"
-	# CID 1 cannot be re-provisioned while attached (+CME ERROR: 5847), hence the
-	# radio detach around it.
-	at 'AT+CFUN=4' 15 >/dev/null 2>&1
-	# WAIT FOR THE DETACH TO LAND. CEREG keeps reporting the pre-detach state for a few
-	# seconds after CFUN=4, so racing ahead means CGDCONT is written while still attached
-	# (+CME ERROR: 5847 on activation) and wait_registered() returns instantly on a stale
-	# "registered" - the whole ladder then burned through in 6s with every rung failing.
-	_d_end=$(( $(date +%s) + 30 ))
-	while [ "$(date +%s)" -lt "$_d_end" ]; do
-		case "$(at 'AT+CEREG?' 6)" in
-			*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) sleep 2 ;;
-			*) break ;;
-		esac
-	done
-	at "AT+CGDCONT=${CID},\"${PDP_TYPE}\",\"${_apn}\"" 10 >/dev/null 2>&1 || {
-		warn "AT+CGDCONT failed for apn='${_apn}'"
-		at 'AT+CFUN=1' 15 >/dev/null 2>&1
-		return 1
-	}
-	if [ "$SET_ATTACH" = 1 ]; then
-		at "AT+EIAAPN=\"${_apn}\",\"${PDP_TYPE}\"" 10 >/dev/null 2>&1 \
-			|| log "AT+EIAAPN unsupported or rejected (non-fatal)"
-	fi
-	at 'AT+CFUN=1' 15 >/dev/null 2>&1
-	sleep 3
-	return 0
-}
-
-# --- registration & bearer --------------------------------------------------------
-registered() {
-	_r=$(at 'AT+CEREG?' 6)
-	case "$_r" in
-		*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) return 0 ;;
-		*"+CEREG: 0,3"*) return 2 ;;   # registration denied - a subscription problem
-	esac
-	return 1
-}
-
-wait_registered() {
-	_wr_end=$(( $(date +%s) + ${1:-90} ))
-	while [ "$(date +%s)" -lt "$_wr_end" ]; do
-		registered
-		case $? in
-			0) return 0 ;;
-			2) warn "network DENIED registration (+CEREG: x,3) - check the SIM subscription"
-			   return 2 ;;
-		esac
-		sleep 5
-	done
-	return 1
-}
-
-# Radio-cycle rate limiting, enforced ACROSS dialer processes - not within one.
-#
-# The cap exists to stop a hopeless SIM turning into an endless redial storm, and netifd
-# respawns this command whenever it exits, so the thing worth limiting is how often a NEW
-# dialer run may cycle the radio. Applying it per ladder rung instead was wrong twice over:
-# the counters live in process memory and reset on every respawn, so it never limited the
-# storm it was aimed at - while inside a single run it refused the ladder's own fallbacks
-# after the first, which is how a working SIM ended up stuck at
-# "radio cycle rate-limited; not retrying now" and never reached its APN.
-#
-# The APN ladder is bounded at three rungs, so a bring-up is allowed to cycle freely; the
-# gate is checked once, at start, against a timestamp persisted in /var/run.
-CFUN_STAMP=/var/run/fm350-cfun.stamp
-
-# Waits out the backoff rather than returning failure. Exiting on backoff is what turns
-# the limiter into the very thing it exists to prevent: netifd respawns a proto command
-# the moment it exits, so "refuse and exit" produced a respawn every ~3s. We are a
-# long-running command, so sleeping here holds the slot and netifd stays quiet.
-cfun_wait_turn() {
-	_now=$(date +%s)
-	_last=0
-	[ -r "$CFUN_STAMP" ] && _last=$(cat "$CFUN_STAMP" 2>/dev/null || echo 0)
-	case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
-	_wait=$(( 180 - (_now - _last) ))
-	if [ "$_wait" -gt 0 ]; then
-		log "radio cycled ${_wait}s ago; waiting out the backoff before dialling"
-		sleep "$_wait"
-	fi
-	date +%s > "$CFUN_STAMP"
-}
-
-activate() {
-	at "AT+CGACT=1,${CID}" 30 >/dev/null 2>&1
-	_a=$(at 'AT+CGACT?' 8)
-	case "$_a" in *"+CGACT: ${CID},1"*) return 0 ;; esac
-	return 1
-}
-
-# --- address extraction -----------------------------------------------------------
-current_ip() {
-	at "AT+CGPADDR=${CID}" 8 \
-		| sed -n 's/.*+CGPADDR: *[0-9]*, *"\{0,1\}\([0-9.]*\)"\{0,1\}.*/\1/p' \
-		| head -1
-}
-
-# CGCONTRDP gives APN + local addr/mask + gateway + both DNS in one command, and is
-# standard - preferred over the vendor-specific AT+GTDNS.
-read_rdp() {
-	RDP_MASK=""; RDP_GW=""; RDP_DNS1=""; RDP_DNS2=""
-	_rdp=$(at "AT+CGCONTRDP=${CID}" 10) || return 1
-	# +CGCONTRDP: <cid>,<bid>,<apn>,<addr.mask (8 octets)>,<gw>,<dns1>,<dns2>
-	_f4=$(printf '%s' "$_rdp" | sed -n 's/.*+CGCONTRDP:[^,]*,[^,]*,[^,]*,"\{0,1\}\([0-9.]*\)"\{0,1\}.*/\1/p' | head -1)
-	_octets=$(printf '%s' "$_f4" | tr '.' ' ' | wc -w)
-	if [ "$_octets" = 8 ]; then
-		RDP_MASK=$(printf '%s' "$_f4" | cut -d. -f5-8)
-	fi
-	RDP_GW=$(printf '%s' "$_rdp" | sed -n 's/.*+CGCONTRDP:[^,]*,[^,]*,[^,]*,[^,]*,"\{0,1\}\([0-9.]*\)"\{0,1\}.*/\1/p' | head -1)
+read_dns() {
+	RDP_DNS1=""; RDP_DNS2=""
+	_rdp=$(at "AT+CGCONTRDP=$1" 10) || return 1
 	RDP_DNS1=$(printf '%s' "$_rdp" | awk -F, '{gsub(/"/,""); print $6}' | head -1)
 	RDP_DNS2=$(printf '%s' "$_rdp" | awk -F, '{gsub(/"/,""); print $7}' | head -1)
-	return 0
 }
 
-mask_to_prefix() {
-	_m="$1"; _p=0
-	for _o in $(printf '%s' "$_m" | tr '.' ' '); do
-		case "$_o" in
-			255) _p=$(( _p + 8 )) ;; 254) _p=$(( _p + 7 )) ;; 252) _p=$(( _p + 6 )) ;;
-			248) _p=$(( _p + 5 )) ;; 240) _p=$(( _p + 4 )) ;; 224) _p=$(( _p + 3 )) ;;
-			192) _p=$(( _p + 2 )) ;; 128) _p=$(( _p + 1 )) ;; 0) ;;
-			*) return 1 ;;
-		esac
-	done
-	printf '%s' "$_p"
-}
-
-# --- publication ------------------------------------------------------------------
-# NOTE: proto_set_keep is deliberately NEVER called. With keep=1 netifd leaves the
-# previous address attached when the network renumbers us, producing two addresses on
-# the interface and packets sourced from the dead one - a silent, total loss of the
-# uplink that looks like a carrier fault.
+# NOTE: proto_set_keep is deliberately never called. With keep=1 netifd leaves the previous
+# address attached across a renumber, giving two addresses and traffic sourced from the dead
+# one - a silent, total loss of the uplink.
 publish() {
 	_ip="$1"
-	read_rdp || true
+	read_dns "$AID" || true
 
-	_prefix=24
-	if [ -n "$RDP_MASK" ]; then
-		_p=$(mask_to_prefix "$RDP_MASK") && [ -n "$_p" ] && [ "$_p" -gt 0 ] \
-			&& [ "$_p" -le 32 ] && _prefix="$_p"
-	fi
-	_gw="$RDP_GW"
-	case "$_gw" in
-		''|0.0.0.0)
-			# Field-verified fallback: cellular is point-to-point and this modem
-			# reports no gateway, so use the .1 of the granted /24.
-			_gw="${_ip%.*}.1"
-			_prefix=24
-			;;
-	esac
+	# The generic rndis_host profile does not set NOARP for this device (OpenWrt PR #24196
+	# adds FLAG_WWAN|POINTTOPOINT|NOARP for 0e8d:7127). Without this the link passes no
+	# traffic; with it alone it still does not - both this and the single-context rule are
+	# required, which is why either one tested on its own looked like a dead end.
+	ip link set "$MODEM_NETDEV" arp off 2>/dev/null
+	ip link set "$MODEM_NETDEV" up 2>/dev/null
+	[ "$MTU" != 0 ] && ip link set "$MODEM_NETDEV" mtu "$MTU" 2>/dev/null
 
 	proto_init_update "$MODEM_NETDEV" 1
-	proto_add_ipv4_address "$_ip" "$_prefix"
-	proto_add_ipv4_route "0.0.0.0" 0 "$_gw"
+	# Cellular is point-to-point and this modem reports no gateway or netmask; the
+	# field-verified convention is the granted address as a /24 with .1 as the next hop.
+	proto_add_ipv4_address "$_ip" 24
+	proto_add_ipv4_route "0.0.0.0" 0 "${_ip%.*}.1"
 	if [ "$PEERDNS" = 1 ]; then
 		for _d in "$RDP_DNS1" "$RDP_DNS2"; do
 			case "$_d" in
@@ -257,17 +147,14 @@ publish() {
 			esac
 		done
 	fi
-	[ "$MTU" != 0 ] && proto_add_data && json_add_int mtu "$MTU" && proto_close_data
 	proto_send_update "$INTERFACE"
 
-	ip link set "$MODEM_NETDEV" up 2>/dev/null
 	LAST_IP="$_ip"
-	log "published ${_ip}/${_prefix} gw ${_gw} dev ${MODEM_NETDEV} metric ${METRIC}"
+	log "published ${_ip}/24 gw ${_ip%.*}.1 aid ${AID} dev ${MODEM_NETDEV}"
 }
 
-# --- bring-up ---------------------------------------------------------------------
 at_state_load || modem_discover_locked || {
-	warn "no FM350 found on the USB bus"
+	warn "no FM350 on the USB bus"
 	proto_notify_error "$INTERFACE" NO_MODEM
 	proto_block_restart "$INTERFACE"
 	exit 1
@@ -291,83 +178,74 @@ case "$(at 'AT+CPIN?' 8)" in
 		exit 1
 		;;
 esac
-
-# URCs are best-effort on a single-port modem, but cost nothing to enable.
 at 'AT+CGEREP=2,1' 6 >/dev/null 2>&1
 
-# One gate for the whole bring-up, not one per rung.
-cfun_wait_turn
-
-attach_ok=0
-for attempt in blank table manual; do
-	case "$attempt" in
-		blank)
-			[ -n "$APN" ] && continue          # explicit override wins outright
-			try_apn=""
-			;;
-		table)
-			[ -n "$APN" ] && continue
-			try_apn=$(apn_from_table) || continue
-			log "blank APN did not attach; trying IMSI table entry '$try_apn'"
-			;;
-		manual)
-			[ -n "$APN" ] || continue
-			try_apn="$APN"
+# Registration is a precondition, but there is no radio cycling here: nothing below
+# reprovisions the attach context, so there is nothing to detach for. Removing the CFUN
+# cycle also removes the main way this dialer used to wedge the modem.
+_reg_end=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_reg_end" ]; do
+	case "$(at 'AT+CEREG?' 6)" in
+		*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) break ;;
+		*"+CEREG: 0,3"*)
+			warn "network DENIED registration - check the SIM subscription"
+			proto_notify_error "$INTERFACE" REGISTRATION_DENIED
+			proto_block_restart "$INTERFACE"
+			exit 1
 			;;
 	esac
-
-	program_apn "$try_apn" || continue
-
-	wait_registered 90
-	rc=$?
-	if [ "$rc" = 2 ]; then
-		# Denied is a subscription problem; cycling the radio will not fix it and
-		# would just churn. Surface it and stop.
-		proto_notify_error "$INTERFACE" REGISTRATION_DENIED
-		proto_block_restart "$INTERFACE"
-		exit 1
-	fi
-	[ "$rc" = 0 ] || continue
-
-	activate || { warn "PDP activation failed on cid ${CID}"; continue; }
-	attach_ok=1
-	break
+	sleep 5
 done
 
-[ "$attach_ok" = 1 ] || {
-	warn "could not establish a bearer"
+deactivate_all
+
+AID=""
+for attempt in blank table manual; do
+	case "$attempt" in
+		blank)  [ -n "$APN" ] && continue; try_apn="" ;;
+		table)  [ -n "$APN" ] && continue
+		        try_apn=$(apn_from_table) || continue
+		        log "blank APN did not activate; trying IMSI table entry '$try_apn'" ;;
+		manual) [ -n "$APN" ] || continue; try_apn="$APN" ;;
+	esac
+	AID=$(activate "$try_apn")
+	[ -n "$AID" ] && { log "activated apn='${try_apn:-<subscription default>}' aid=${AID}"; break; }
+	AID=""
+	deactivate_all
+done
+
+[ -n "$AID" ] || {
+	warn "could not activate a PDP context"
 	proto_notify_error "$INTERFACE" NO_BEARER
 	exit 1
 }
 
-ip=$(current_ip)
+ip=$(ipv4_of "$AID")
 [ -n "$ip" ] || {
-	warn "activated but no address on cid ${CID}"
+	warn "activated aid ${AID} but no IPv4 address was granted"
 	proto_notify_error "$INTERFACE" NO_ADDRESS
 	exit 1
 }
 
-# The interface goes up at 'bearer' - we hold an address - rather than waiting for a
-# data-plane probe to succeed. Gating on data would deadlock: the probe needs the route
-# that only publishing installs. Data health is monitored continuously below instead.
+# Up at 'bearer': we hold an address. Gating on a data probe would deadlock, because the
+# probe needs the route that only publishing installs.
 publish "$ip"
 
-# --- monitor ----------------------------------------------------------------------
 while :; do
 	sleep "$POLL_INTERVAL" &
 	wait $! 2>/dev/null
 
 	if [ "$REPUBLISH" = 1 ]; then
 		REPUBLISH=0
-		cur=$(current_ip)
+		cur=$(ipv4_of "$AID")
 		[ -n "$cur" ] && publish "$cur"
 		continue
 	fi
 
-	cur=$(current_ip)
+	cur=$(ipv4_of "$AID")
 	if [ -z "$cur" ]; then
-		# Two confirmations before believing the bearer is gone: a single missed
-		# poll is far more likely to be AT-port contention than a dropped bearer.
+		# Two confirmations: one missed poll is far more likely to be AT-port contention
+		# than a dropped bearer.
 		PDP_DOWN_STREAK=$(( PDP_DOWN_STREAK + 1 ))
 		if [ "$PDP_DOWN_STREAK" -ge 2 ]; then
 			warn "bearer lost (confirmed); requesting teardown"
@@ -378,23 +256,17 @@ while :; do
 	fi
 	PDP_DOWN_STREAK=0
 
-	if [ "$cur" != "$LAST_IP" ]; then
-		# A changed address is a re-publish, never a re-dial.
-		log "address changed ${LAST_IP} -> ${cur}; re-publishing"
-		publish "$cur"
-		continue
-	fi
+	[ "$cur" != "$LAST_IP" ] && { log "address changed ${LAST_IP} -> ${cur}"; publish "$cur"; continue; }
 
-	# Black-hole detector. Never ping the gateway: this modem's pseudo-gateway never
-	# answers ICMP, so gateway loss is meaningless here. Instead watch the counters -
-	# tx climbing while rx stays flat is the signature of the wrong PDP context.
+	# Never ping the .1 pseudo-gateway - it does not answer. Watch the counters instead:
+	# tx climbing while rx stays flat is the signature of a context RNDIS is not carrying,
+	# so log which aids are active, since more than one is the known cause.
 	tx=$(cat "/sys/class/net/${MODEM_NETDEV}/statistics/tx_packets" 2>/dev/null || echo 0)
 	rx=$(cat "/sys/class/net/${MODEM_NETDEV}/statistics/rx_packets" 2>/dev/null || echo 0)
 	if [ "$tx" -gt "$LAST_TX" ] && [ "$rx" -le "$LAST_RX" ]; then
 		BLACKHOLE=$(( BLACKHOLE + 1 ))
 		if [ "$BLACKHOLE" -ge 3 ]; then
-			warn "tx rising, rx flat for 3 windows - possible PDP context drift:"
-			warn "$(at "AT+CGDCONT?" 8 | tr '\n' ' ')"
+			warn "tx rising, rx flat for 3 windows - active aids: $(active_aids | tr '\n' ' ')"
 			BLACKHOLE=0
 		fi
 	else

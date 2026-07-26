@@ -56,15 +56,17 @@ network.registerProtocol('fm350', {
 		o.default = 'IPV4V6';
 		o.description = _('Always request IPv4/IPv6. If the subscription allows only one family the network downgrades inside an accept, which is a success - not a reason to re-dial.');
 
-		o = s.taboption('general', form.Value, 'pdp_index', _('PDP context id'));
-		o.datatype = 'range(1,15)';
-		o.default = '1';
-		o.description = _('Hardware constraint, not a preference: this modem forwards RNDIS traffic on the initial bearer only. On another context you get an IP address and every packet is silently dropped.');
+		o = s.taboption('general', form.ListValue, 'apn_type', _('APN type'));
+		o.value('default', _('default (internet)'));
+		o.value('net', 'net');
+		o.value('tethering', 'tethering');
+		o.default = 'default';
+		o.description = _('Selects which bearer the RNDIS data path carries. The modem chooses the context id itself, so there is no context number to set. Verified working as "default" on China Telecom.');
 
 		o = s.taboption('general', form.ListValue, 'auth', _('Authentication'));
 		o.value('none', _('None'));
 		o.default = 'none';
-		o.description = _('Only "none" is accepted. PAP/CHAP would need the initial-attach-APN command, which is out of scope here.');
+		o.description = _('Only "none" is accepted; this modem has no +CGAUTH.');
 
 		o = s.taboption('advanced', form.Flag, 'peerdns', _('Use carrier DNS'));
 		o.default = '1';
@@ -78,8 +80,4 @@ network.registerProtocol('fm350', {
 		o.datatype = 'max(9200)';
 		o.placeholder = _('(from the network)');
 
-		o = s.taboption('advanced', form.Flag, 'set_attach_apn', _('Also set the attach APN'));
-		o.default = '0';
-		o.description = _('Sends the initial-attach-APN command in addition to the context definition. Off by default because it is rejected on the firmware this was developed against.');
-	}
 });

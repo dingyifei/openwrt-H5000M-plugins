@@ -23,19 +23,18 @@ proto_fm350_init_config() {
 
 	proto_config_add_string apn
 	proto_config_add_string pdp_type
-	proto_config_add_int pdp_index
+	proto_config_add_string apn_type
 	proto_config_add_string auth
 	proto_config_add_int metric
 	proto_config_add_int mtu
-	proto_config_add_boolean set_attach_apn
 	proto_config_add_boolean peerdns
 }
 
 proto_fm350_setup() {
 	local interface="$1"
-	local apn pdp_type pdp_index auth metric mtu set_attach_apn peerdns
+	local apn pdp_type apn_type auth metric mtu peerdns
 
-	json_get_vars apn pdp_type pdp_index auth metric mtu set_attach_apn peerdns
+	json_get_vars apn pdp_type apn_type auth metric mtu peerdns
 
 	# This modem has no +CGAUTH at all - PAP/CHAP would require AT+EIAAPN and is out
 	# of scope - so anything other than 'none' is a configuration error we must not
@@ -49,20 +48,17 @@ proto_fm350_setup() {
 			;;
 	esac
 
-	# PDP context 1 is not a default, it is a hardware constraint: the FM350 in RNDIS
-	# mode forwards traffic only on the initial/default bearer. Putting the APN on any
-	# other context yields an IP address and then silently drops every packet (tx
-	# climbs, rx stays at ~2, NETDEV WATCHDOG in dmesg).
-	[ -n "$pdp_index" ] || pdp_index=1
+	# The modem picks the context id itself via +EAPNACT; what matters is the APN TYPE and
+	# that exactly one context is active. A fixed pdp_index was the old model and is gone.
+	[ -n "$apn_type" ] || apn_type=default
 
 	proto_run_command "$interface" /usr/sbin/fm350-dialer \
 		-i "$interface" \
 		-a "${apn-}" \
 		-t "${pdp_type:-IPV4V6}" \
-		-c "$pdp_index" \
+		-y "$apn_type" \
 		-m "${metric:-20}" \
 		-u "${mtu:-0}" \
-		-e "${set_attach_apn:-1}" \
 		-d "${peerdns:-1}"
 }
 
