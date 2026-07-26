@@ -25,7 +25,10 @@ if [ "$(uci -q get network.cellular)" != 'interface' ]; then
 	uci -q set network.cellular.auth='none'
 	# Lowest-priority uplink by default; mwan3 owns real failover ordering.
 	uci -q set network.cellular.metric='20'
-	uci -q set network.cellular.auto='0'
+	# Come up at boot. Verified end to end on hardware: ifup brings the link up unattended
+	# and passes traffic, so there is no longer a reason to hold it down. The metric keeps
+	# it behind wired and Wi-Fi, so enabling it cannot steal a working uplink.
+	uci -q set network.cellular.auto='1'
 fi
 
 # --- 464xlat child ---------------------------------------------------------------
