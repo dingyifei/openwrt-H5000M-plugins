@@ -51,9 +51,6 @@ PDP_DOWN_STREAK=0
 BLACKHOLE=0
 LAST_TX=0
 LAST_RX=0
-CFUN_LAST=0
-CFUN_COUNT=0
-CFUN_WINDOW=0
 
 log() { logger -t "fm350[$INTERFACE]" -p daemon.info "$*"; }
 warn() { logger -t "fm350[$INTERFACE]" -p daemon.warn "$*"; }
@@ -101,6 +98,17 @@ program_apn() {
 	# CID 1 cannot be re-provisioned while attached (+CME ERROR: 5847), hence the
 	# radio detach around it.
 	at 'AT+CFUN=4' 15 >/dev/null 2>&1
+	# WAIT FOR THE DETACH TO LAND. CEREG keeps reporting the pre-detach state for a few
+	# seconds after CFUN=4, so racing ahead means CGDCONT is written while still attached
+	# (+CME ERROR: 5847 on activation) and wait_registered() returns instantly on a stale
+	# "registered" - the whole ladder then burned through in 6s with every rung failing.
+	_d_end=$(( $(date +%s) + 30 ))
+	while [ "$(date +%s)" -lt "$_d_end" ]; do
+		case "$(at 'AT+CEREG?' 6)" in
+			*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) sleep 2 ;;
+			*) break ;;
+		esac
+	done
 	at "AT+CGDCONT=${CID},\"${PDP_TYPE}\",\"${_apn}\"" 10 >/dev/null 2>&1 || {
 		warn "AT+CGDCONT failed for apn='${_apn}'"
 		at 'AT+CFUN=1' 15 >/dev/null 2>&1
@@ -111,6 +119,7 @@ program_apn() {
 			|| log "AT+EIAAPN unsupported or rejected (non-fatal)"
 	fi
 	at 'AT+CFUN=1' 15 >/dev/null 2>&1
+	sleep 3
 	return 0
 }
 
@@ -138,16 +147,35 @@ wait_registered() {
 	return 1
 }
 
-# cfun_allowed - rate-limit radio cycles so a bad SIM cannot turn into a redial storm.
-cfun_allowed() {
+# Radio-cycle rate limiting, enforced ACROSS dialer processes - not within one.
+#
+# The cap exists to stop a hopeless SIM turning into an endless redial storm, and netifd
+# respawns this command whenever it exits, so the thing worth limiting is how often a NEW
+# dialer run may cycle the radio. Applying it per ladder rung instead was wrong twice over:
+# the counters live in process memory and reset on every respawn, so it never limited the
+# storm it was aimed at - while inside a single run it refused the ladder's own fallbacks
+# after the first, which is how a working SIM ended up stuck at
+# "radio cycle rate-limited; not retrying now" and never reached its APN.
+#
+# The APN ladder is bounded at three rungs, so a bring-up is allowed to cycle freely; the
+# gate is checked once, at start, against a timestamp persisted in /var/run.
+CFUN_STAMP=/var/run/fm350-cfun.stamp
+
+# Waits out the backoff rather than returning failure. Exiting on backoff is what turns
+# the limiter into the very thing it exists to prevent: netifd respawns a proto command
+# the moment it exits, so "refuse and exit" produced a respawn every ~3s. We are a
+# long-running command, so sleeping here holds the slot and netifd stays quiet.
+cfun_wait_turn() {
 	_now=$(date +%s)
-	[ $(( _now - CFUN_LAST )) -ge 180 ] || return 1
-	if [ $(( _now - CFUN_WINDOW )) -ge 3600 ]; then
-		CFUN_WINDOW="$_now"; CFUN_COUNT=0
+	_last=0
+	[ -r "$CFUN_STAMP" ] && _last=$(cat "$CFUN_STAMP" 2>/dev/null || echo 0)
+	case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+	_wait=$(( 180 - (_now - _last) ))
+	if [ "$_wait" -gt 0 ]; then
+		log "radio cycled ${_wait}s ago; waiting out the backoff before dialling"
+		sleep "$_wait"
 	fi
-	[ "$CFUN_COUNT" -lt 5 ] || return 1
-	CFUN_LAST="$_now"; CFUN_COUNT=$(( CFUN_COUNT + 1 ))
-	return 0
+	date +%s > "$CFUN_STAMP"
 }
 
 activate() {
@@ -267,6 +295,9 @@ esac
 # URCs are best-effort on a single-port modem, but cost nothing to enable.
 at 'AT+CGEREP=2,1' 6 >/dev/null 2>&1
 
+# One gate for the whole bring-up, not one per rung.
+cfun_wait_turn
+
 attach_ok=0
 for attempt in blank table manual; do
 	case "$attempt" in
@@ -285,7 +316,6 @@ for attempt in blank table manual; do
 			;;
 	esac
 
-	cfun_allowed || { warn "radio cycle rate-limited; not retrying now"; break; }
 	program_apn "$try_apn" || continue
 
 	wait_registered 90
