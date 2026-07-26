@@ -1,22 +1,82 @@
 #!/bin/sh
 # H5000M Travelmate defaults — idempotent first-boot setup.
-# Establishes exactly one disabled STA VIF bound to trm_wwan, owned by Travelmate.
-# Full Phase 3.1 logic is TODO; this skeleton is idempotent and safe to re-run.
+# Establishes exactly one disabled STA VIF bound to trm_wwan, owned by Travelmate,
+# plus the trm_wwan DHCP interface and its wan-zone firewall membership.
 #
 # Hard rules: preserve discovered AP sections; no baked SSID/PSK; never assume mtwifi/.dat.
-set -e
+#
+# No `set -e`: uci -q get on an absent key returns non-zero, which would abort the
+# script under set -e. Matches 90-h5000m-base; each step below is individually idempotent.
 
-MARK=/etc/h5000m/.travelmate-defaults-applied
-[ -f "$MARK" ] && exit 0            # idempotent: already applied
+# --- STA VIF: pick a radio (prefer 5 GHz, else first) --------------------------
+# Discover mac80211 radios generically; never hard-code radio0/radio1.
+target_radio=''
+first_radio=''
+for radio in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-device$/\1/p'); do
+	[ -n "$first_radio" ] || first_radio="$radio"
+	if [ "$(uci -q get "${radio}.band")" = '5g' ]; then
+		target_radio="$radio"
+		break
+	fi
+done
+[ -n "$target_radio" ] || target_radio="$first_radio"
 
-# TODO(Phase 3.1):
-#   - discover the mac80211 radio(s) generically (radio0/radio1), do NOT hard-code
-#   - create/normalize exactly ONE disabled wifi-iface mode='sta' network='trm_wwan'
-#   - create the trm_wwan interface (proto dhcp) + firewall membership owned by Travelmate
-#   - leave it disabled; no SSID/PSK
-#   - commit wireless/network/firewall
-# Reference: ../openwrt-H5000M/ROADMAP.md (3.1), plan file Phase 3.1.
+if [ -n "$target_radio" ]; then
+	radio_name="${target_radio#wireless.}"
 
-mkdir -p /etc/h5000m
-touch "$MARK"
+	# Find an existing STA VIF bound to trm_wwan (by mode+network, never by index).
+	sta_section=''
+	for iface in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get "${iface}.mode")" = 'sta' ] || continue
+		[ "$(uci -q get "${iface}.network")" = 'trm_wwan' ] || continue
+		sta_section="$iface"
+		break
+	done
+
+	# Create exactly one if none exists; otherwise normalize the one found.
+	if [ -z "$sta_section" ]; then
+		sta_section="wireless.$(uci add wireless wifi-iface)"
+	fi
+
+	# Attach to the preferred radio only when unset, so a Travelmate retarget survives re-runs.
+	[ -n "$(uci -q get "${sta_section}.device")" ] || \
+		uci -q set "${sta_section}.device=${radio_name}"
+	uci -q set "${sta_section}.mode=sta"
+	uci -q set "${sta_section}.network=trm_wwan"
+	uci -q set "${sta_section}.disabled=1"
+	# Never bake upstream credentials — Travelmate fills these when a profile is added.
+	uci -q delete "${sta_section}.ssid"
+	uci -q delete "${sta_section}.key"
+else
+	logger -t h5000m-travelmate "no mac80211 wifi-device found; skipping STA VIF"
+fi
+
+# --- Preserve AP sections: we never touch mode='ap'; the base owns those. ------
+
+# --- Network: trm_wwan as DHCP, only if absent (never clobber an existing proto).
+if [ "$(uci -q get network.trm_wwan)" != 'interface' ]; then
+	uci -q set network.trm_wwan=interface
+	uci -q set network.trm_wwan.proto='dhcp'
+fi
+
+# --- Firewall: add trm_wwan to the wan zone (found by name, never by index). ----
+wan_zone=''
+for zone in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+	if [ "$(uci -q get "${zone}.name")" = 'wan' ]; then
+		wan_zone="$zone"
+		break
+	fi
+done
+if [ -n "$wan_zone" ]; then
+	member=0
+	for net in $(uci -q get "${wan_zone}.network"); do
+		[ "$net" = 'trm_wwan' ] && member=1
+	done
+	[ "$member" -eq 1 ] || uci -q add_list "${wan_zone}.network=trm_wwan"
+fi
+
+uci -q commit wireless
+uci -q commit network
+uci -q commit firewall
+
 exit 0

@@ -105,9 +105,42 @@ export H5000M_BASE_ARTIFACT=../openwrt-H5000M/artifacts/H5000M-official-base-<re
     scripts/verify-offline-install.sh travelmate             # M1 gate
 ```
 
+Substitute any feature-set name for `travelmate`: `cellular`, `esim`, `tailscale`,
+`mwan3`, or `all` (see `configs/feature-sets.conf`).
+
+## Stage 2 — feature packages (2026-07-26)
+
+Six config/script-only packages, all `PKGARCH:=all`, no credentials:
+
+| Package | Provides |
+|---|---|
+| `h5000m-modem-atd` | FM350 AT broker: sysfs discovery, `atq`, `at-lease`, `modem-ports`, hotplug rules |
+| `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface |
+| `h5000m-lpac` | `h5000m-esim` — lpac over its AT backend, under the port lease |
+| `h5000m-travelmate-defaults` | one disabled STA VIF → `trm_wwan` |
+| `h5000m-tailscale-defaults` | `tailscale0` firewall zone, shipped logged out |
+| `h5000m-mwan3-policy` | wan → trm_wwan → cellular failover, public-IP tracking |
+
+`tests/test-plugin-invariants.sh` enforces the rules that were learned the hard way on
+hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -w`
+(busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
+credentials. It has been negative-controlled — injecting each violation makes it fail.
+
+### Known-good vs not-yet-proven
+
+- ✅ Proven on hardware: AT discovery, `atq`/denylist, APN programming, proto registration,
+  Travelmate/Tailscale uci-defaults (idempotent over three runs, `fw4 check` clean).
+- ⚠️ **The full SDK build of the cellular closure is not yet green locally.** Selecting a
+  package with `DEPENDS:=+<in-feed pkg>` makes the SDK build that dependency from source,
+  and the local (macOS/Docker) toolchain fails part-way through that chain with
+  `configure: error: cannot run /bin/bash ./config.sub`. `EXTRA_DEPENDS` is not a way out:
+  OpenWrt rejects it unless every entry carries a version constraint, which is unworkable
+  under a rolling snapshot. CI on a native Linux runner is the arbiter.
+- ⛔ FM350 end-to-end attach is blocked by the **SIM**, not by code: the fitted SIM is
+  refused by the network (`+CEREG: 0,3`, registration denied) even when forced to its home
+  PLMN. Everything up to and including APN programming works.
+
 ### Next
 
-Add feature sets (Tailscale, FM350, mwan3) to `configs/feature-sets.conf` plus their glue
-packages — each is now a config edit rather than new machinery. Third-party source builds
-(`luci-app-epm`, PassWall2) remain deferred; `configs/sources.lock` is empty and
-`build-packages.sh` fails loudly if it is not.
+Third-party source builds (`luci-app-epm`, PassWall2) remain deferred;
+`configs/sources.lock` is empty and `build-packages.sh` fails loudly if it is not.

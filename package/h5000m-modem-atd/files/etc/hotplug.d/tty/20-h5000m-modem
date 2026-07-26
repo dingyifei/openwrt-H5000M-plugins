@@ -1,0 +1,35 @@
+# FM350 AT port (re)discovery on tty add/remove.
+#
+# Fires once per ttyUSB node, and option binds seven of them, so this would run seven
+# times per plug event. Discovery is cheap but probing is not (it opens and talks to
+# ports), hence the debounce: only the *last* event in a burst does real work.
+
+[ "$SUBSYSTEM" = "tty" ] || return 0
+case "$DEVNAME" in
+	ttyUSB*) ;;
+	*) return 0 ;;
+esac
+
+. /usr/lib/h5000m/atio.sh
+. /usr/lib/h5000m/modem-discover.sh
+
+case "$ACTION" in
+	add)
+		# Debounce: let the rest of the interfaces settle before probing.
+		(
+			sleep 2
+			modem_discover_locked
+		) >/dev/null 2>&1 &
+		;;
+	remove)
+		if [ ! -e "/dev/${DEVNAME}" ]; then
+			at_state_load 2>/dev/null || return 0
+			case "$MODEM_AT_A:$MODEM_AT_B" in
+				*"/dev/${DEVNAME}"*)
+					at_warn "AT port ${DEVNAME} disappeared; invalidating state"
+					rm -f "$H5000M_MODEM_STATE" /dev/modem-at0 /dev/modem-at1
+					;;
+			esac
+		fi
+		;;
+esac

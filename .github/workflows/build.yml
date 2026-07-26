@@ -4,26 +4,113 @@ on:
   pull_request: { branches: [master] }
   workflow_dispatch:
 
+# The signing key arrives as a repository secret and is materialised into the keydir the
+# scripts actually read. Two modes, deliberately:
+#   * secret present  -> release mode, pinned-fingerprint gate, full offline-repo + verify.
+#   * secret absent   -> dev mode (auto-minted throwaway key). configure-sdk then writes
+#     sdk/.h5000m-dev-key, which build-offline-repo.sh refuses to publish from - by design.
+#     So forks and untrusted PRs still get build + tests, but cannot emit a release repo.
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
       - name: Shell syntax check
-        run: for f in scripts/*.sh; do bash -n "$f"; done
-      - name: Fetch + verify SDK
-        run: ./scripts/fetch-official-sdk.sh
-      - name: Configure SDK (packages only)
-        run: ./scripts/configure-sdk.sh
-      - name: Build packages (signed)
-        env: { H5000M_APK_SIGNING_KEY: ${{ secrets.H5000M_APK_SIGNING_KEY }} }
-        run: ./scripts/build-packages.sh
-      - name: Build signed offline repo
-        run: ./scripts/build-offline-repo.sh
-      - name: Verify offline install into exact base
-        run: ./scripts/verify-offline-install.sh
+        run: for f in scripts/*.sh tests/*.sh; do bash -n "$f"; done
+
+      - name: Static plugin invariants
+        run: sh tests/test-plugin-invariants.sh
+
+      - name: Repo self-tests
+        run: |
+          sh tests/test-check-secrets.sh
+          sh tests/test-plugin-signing-key.sh
+
       - name: Secret scan
         run: ./scripts/check-secrets.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends squashfs-tools zstd
+
+      # Never interpolate the secret into a run: line; pass it via env and read it from
+      # there, so it cannot end up in a command line or a log.
+      - name: Materialise signing key
+        id: key
+        env:
+          SIGNING_KEY: ${{ secrets.H5000M_APK_SIGNING_KEY }}
+        run: |
+          set -eu
+          if [ -z "${SIGNING_KEY}" ]; then
+            echo "no signing key secret; using dev mode (cannot publish a release repo)"
+            echo "mode=dev" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          install -d -m 0700 "$HOME/.config/h5000m-apk"
+          printf '%s\n' "${SIGNING_KEY}" > "$HOME/.config/h5000m-apk/private-key.pem"
+          chmod 0600 "$HOME/.config/h5000m-apk/private-key.pem"
+          openssl pkey -in "$HOME/.config/h5000m-apk/private-key.pem" -pubout \
+            -out "$HOME/.config/h5000m-apk/public-key.pem"
+          chmod 0644 "$HOME/.config/h5000m-apk/public-key.pem"
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch + verify SDK
+        run: ./scripts/fetch-official-sdk.sh
+
+      - name: Configure SDK (packages only)
+        env: { H5000M_APK_KEY_MODE: "${{ steps.key.outputs.mode }}" }
+        run: ./scripts/configure-sdk.sh
+
+      - name: Build packages (signed)
+        env: { H5000M_APK_KEY_MODE: "${{ steps.key.outputs.mode }}" }
+        run: ./scripts/build-packages.sh
+
+      # build-offline-repo.sh and verify-offline-install.sh both hard-require a base
+      # artifact (they unsquash the exact rootfs and resolve against its own apk db).
+      # This repo does not produce one, so it is pulled from the sibling firmware repo's
+      # latest successful master build. If that is unavailable the steps are SKIPPED with
+      # a loud message rather than silently passing - a green tick here must not imply the
+      # offline-install gate ran.
+      - name: Fetch base firmware artifact
+        id: base
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.H5000M_BASE_ARTIFACT_TOKEN || github.token }}
+        run: |
+          set -eu
+          run_id="$(gh run list --repo dingyifei/openwrt-H5000M \
+            --workflow build.yml --branch master --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
+          if [ -z "${run_id:-}" ]; then
+            echo "::warning::no successful base firmware build found; offline-install gate will be SKIPPED"
+            exit 1
+          fi
+          gh run download "$run_id" --repo dingyifei/openwrt-H5000M \
+            --name H5000M-official-base --dir base-artifact
+          dir="$(find base-artifact -maxdepth 2 -name BUILD-INFO.txt -exec dirname {} \; | head -1)"
+          [ -n "$dir" ] || { echo "::warning::artifact has no BUILD-INFO.txt"; exit 1; }
+          echo "dir=$(cd "$dir" && pwd)" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed offline repo
+        if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
+        env: { H5000M_BASE_ARTIFACT: "${{ steps.base.outputs.dir }}" }
+        run: sudo -E ./scripts/build-offline-repo.sh cellular
+
+      - name: Verify offline install into exact base
+        if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
+        env: { H5000M_BASE_ARTIFACT: "${{ steps.base.outputs.dir }}" }
+        run: sudo -E ./scripts/verify-offline-install.sh cellular
+
+      - name: Report skipped gates
+        if: steps.base.outcome != 'success' || steps.key.outputs.mode != 'release'
+        run: |
+          echo "::warning::offline-repo + offline-install verification did NOT run"
+          echo "  base artifact: ${{ steps.base.outcome }} · key mode: ${{ steps.key.outputs.mode }}"
+
       - uses: actions/upload-artifact@v4
+        if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
         with: { name: offline-repo, path: offline-repo/ }
-# NOTE: release signing uses a protected persistent key/runner; never log private material.
+# NOTE: release signing uses a protected persistent key; never log private material.

@@ -1,0 +1,87 @@
+#!/bin/sh
+# h5000m-esim - thin wrapper running lpac's AT backend under the FM350 AT-port lease.
+#
+# WHY a wrapper at all: the FM350-GL exposes exactly ONE working AT port (verified on
+# this unit - see h5000m-modem-atd). lpac drives that port with a long APDU conversation
+# (open a logical channel, stream ES10x, close) that must NOT be interleaved with the
+# dialer's status polling, or both desynchronise. at-lease takes the same flock every
+# other AT consumer takes and holds it for lpac's whole lifetime, and it exports
+# MODEM_AT_B (the leased port) into our environment - so we never name a ttyUSB node,
+# which would be wrong anyway since they renumber across re-enumeration.
+#
+# lpac AT backend environment (CONFIRMED against upstream docs, estkme-group/lpac,
+# docs/backends/at.md and docs/ENVVARS.md):
+#   LPAC_APDU=at              select the AT APDU backend (AT+CCHO / CCHC / CGLA)
+#   LPAC_APDU_AT_DEVICE=<dev> serial device the AT backend opens
+# Both may be pre-set in the caller's environment to override, e.g. LPAC_APDU=at_csim for
+# a modem that only implements AT+CSIM.
+#
+# UNCONFIRMED HARDWARE: it is not known whether this unit even has an eUICC - the vendor
+# firmware shipped zero eSIM support. `h5000m-esim chip info` is the single command that
+# settles it. Nothing below assumes an eUICC is present.
+
+set -u
+
+ATIO=/usr/lib/h5000m/atio.sh
+
+usage() {
+	cat <<'EOF'
+Usage: h5000m-esim <lpac arguments...>
+
+Thin wrapper around `lpac`, run under the FM350 AT-port lease so it can never
+collide with the cellular dialer on the modem's single AT port. All arguments
+are passed straight through to lpac.
+
+Examples:
+  h5000m-esim chip info          # identify the eUICC (settles whether one exists)
+  h5000m-esim profile list       # list installed eSIM profiles
+  h5000m-esim notification list  # pending SM-DP+ notifications
+
+The AT backend is selected automatically (LPAC_APDU=at) against the leased AT
+port (LPAC_APDU_AT_DEVICE=$MODEM_AT_B). Override either by exporting it first:
+  LPAC_APDU=at_csim h5000m-esim chip info
+
+Run `lpac --help` for the full command set.
+EOF
+}
+
+case "${1:-}" in
+	-h|--help|'')
+		usage
+		exit 0
+		;;
+esac
+
+# lpac present?
+if ! command -v lpac >/dev/null 2>&1; then
+	echo "h5000m-esim: lpac is not installed. Install the 'lpac' package to use eSIM." >&2
+	exit 1
+fi
+
+# at-lease present? (shipped by h5000m-modem-atd, a hard dependency)
+if ! command -v at-lease >/dev/null 2>&1; then
+	echo "h5000m-esim: at-lease not found - is h5000m-modem-atd installed?" >&2
+	exit 1
+fi
+
+# Pre-flight the modem state so we can print something more actionable than a lock error.
+# The state file path comes from atio.sh (H5000M_MODEM_STATE); never hard-coded here.
+if [ -r "$ATIO" ]; then
+	# shellcheck disable=SC1090
+	. "$ATIO"
+	if [ ! -r "$H5000M_MODEM_STATE" ]; then
+		echo "h5000m-esim: no modem state at $H5000M_MODEM_STATE." >&2
+		echo "  The FM350 AT port has not been discovered yet. Check the modem is" >&2
+		echo "  powered/enumerated (try 'modem-ports') and h5000m-modem-atd is running." >&2
+		exit 1
+	fi
+fi
+
+# Hand the leased AT port to lpac. at-lease exports MODEM_AT_B into our child; bind the
+# lpac AT backend to it unless the caller already chose a device/backend. The inner
+# positional args are the user's lpac arguments ($0 is a label only).
+exec at-lease sh -c '
+	export LPAC_APDU="${LPAC_APDU:-at}"
+	export LPAC_APDU_AT_DEVICE="${LPAC_APDU_AT_DEVICE:-$MODEM_AT_B}"
+	exec lpac "$@"
+' lpac "$@"

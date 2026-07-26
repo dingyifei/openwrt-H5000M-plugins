@@ -1,0 +1,50 @@
+# IMSI (MCC+MNC) -> APN. Consulted ONLY when a blank APN fails to attach.
+#
+# This table is an optimisation, not the primary path. A blank APN requests the
+# subscription default, which 3GPP guarantees the HSS/UDM supplies (TS 27.007 10.1.1,
+# TS 29.272), so it is self-correcting across every carrier, MVNO and travel eSIM. A
+# *guessed* APN is not: it yields ESM cause #27 or silently attaches to the wrong PGW.
+#
+# Therefore: only rows verified High-confidence in docs/apn-reference.md appear here.
+# Low-confidence travel-eSIM rows deliberately stay documentation. In particular there
+# is NO generic "internet" fallback - it is a real APN on some networks and rejected on
+# others, which would turn a working blank attach into a failure.
+#
+# Chinese IoT SIMs broadcast the same MCC-MNC as consumer SIMs, so this table cannot
+# distinguish them and will confidently pick the wrong APN; blank-first is what saves us.
+#
+# Format: <mccmnc> <apn>
+
+# --- China (MCC 460) ---
+46000 cmnet
+46002 cmnet
+46004 cmnet
+46007 cmnet
+46008 cmnet
+46001 3gnet
+46006 3gnet
+46009 3gnet
+46003 ctnet
+46005 ctnet
+46011 ctnet
+46015 cbnet
+
+# --- United States ---
+# AT&T documents "broadband" for data devices (KM1062162); nxtgenphone is the
+# phone-line fallback and is deliberately not used here.
+310410 broadband
+310280 broadband
+311180 broadband
+# T-Mobile US is IPv6-only in practice; 464xlat on the router surfaces IPv4.
+310260 fast.t-mobile.com
+310160 fast.t-mobile.com
+310200 fast.t-mobile.com
+310240 fast.t-mobile.com
+311882 fast.t-mobile.com
+312530 fast.t-mobile.com
+311480 vzwinternet
+310004 vzwinternet
+310010 vzwinternet
+310012 vzwinternet
+310890 vzwinternet
+311270 vzwinternet

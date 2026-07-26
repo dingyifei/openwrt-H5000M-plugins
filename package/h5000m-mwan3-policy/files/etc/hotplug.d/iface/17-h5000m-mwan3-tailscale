@@ -1,0 +1,56 @@
+#!/bin/sh
+# h5000m mwan3 hook - keep Tailscale traffic out of mwan3's policy routing.
+#
+# WHY THIS PATH. Two candidate locations were rejected against upstream sources:
+#   * /etc/mwan3.user - upstream mwan3 ships it AND lists it in `conffiles`, so shipping
+#     our own would be a file collision that clobbers the user's edits.
+#   * /etc/mwan3.user.d/ - not a real extension point. Verified: upstream mwan3.user is a
+#     20-line comment-only stub that sources nothing, so a drop-in there would NEVER RUN.
+# mwan3 invokes mwan3.user from its own iface hotplug script
+# (/etc/hotplug.d/iface/16-mwan3-user), so an additive hook that genuinely executes
+# belongs in the same directory, ordered after it. It receives the standard iface hotplug
+# variables - exactly the ones mwan3 documents for mwan3.user: ACTION, INTERFACE, DEVICE.
+#
+# WHY exclude tailscale0: Tailscale marks its own packets with fwmark 0xff0000 and mwan3
+# marks with 0x3F00 (mask). Those masks do NOT overlap, so there is no bit collision -
+# but traffic that ingresses tailscale0 must still never be policy-routed onto a WAN
+# member, or Tailscale's own subnet/exit routing breaks. We add ONE rule that skips
+# mwan3 marking (returns early) for anything coming in on tailscale0.
+#
+# SAFE IF TAILSCALE IS ABSENT: if the tailscale0 device does not exist we do nothing.
+# ADDITIVE + IDEMPOTENT: the rule is inserted only when an identical one is not present,
+# tagged with a grep-able comment. Every firewall command is best-effort (failures are
+# swallowed) so a wrong chain name on some future mwan3 can never break mwan3 itself.
+#
+# ASSUMED (could not be verified on hardware here): the fw4/nftables chain that mwan3
+# hangs its mangle marking off of. The nft branch below targets the mwan3 mangle
+# prerouting chain by its documented name; if mwan3 renames it, the insert simply no-ops
+# and mwan3 keeps working. The iptables branch targets mwan3's classic `mwan3_hook`
+# mangle chain. Confirm the exact chain on the target and tighten if needed.
+
+TAG='h5000m-tailscale-mwan3'
+
+# mwan3 re-runs this on every netifd event; only act on up-ish transitions.
+_act=0
+case "${ACTION:-}" in
+	ifup|connected|'') _act=1 ;;
+esac
+
+if [ "$_act" = 1 ] && [ -d /sys/class/net/tailscale0 ]; then
+	if command -v nft >/dev/null 2>&1 && nft list table inet fw4 >/dev/null 2>&1; then
+		# fw4/nftables path. Return early from mwan3's mangle prerouting for tailscale0.
+		if ! nft -a list table inet fw4 2>/dev/null | grep -q "$TAG"; then
+			nft insert rule inet fw4 mangle_prerouting \
+				iifname "tailscale0" counter return \
+				comment "\"$TAG\"" 2>/dev/null || true
+		fi
+	elif command -v iptables >/dev/null 2>&1; then
+		# Legacy fw3/iptables path: RETURN from mwan3's mangle hook chain.
+		if ! iptables -t mangle -C mwan3_hook -i tailscale0 -j RETURN 2>/dev/null; then
+			iptables -t mangle -I mwan3_hook -i tailscale0 -j RETURN 2>/dev/null || true
+		fi
+	fi
+fi
+
+# Works whether we were sourced (mwan3.user style) or executed directly.
+return 0 2>/dev/null || exit 0

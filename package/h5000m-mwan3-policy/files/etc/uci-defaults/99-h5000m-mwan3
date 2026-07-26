@@ -1,0 +1,81 @@
+#!/bin/sh
+# H5000M mwan3 defaults - idempotent first-boot failover policy.
+#
+# Three uplinks, strict failover by metric (distinct metrics => failover, not
+# load-balance):
+#   1. wan       wired uplink              metric 1
+#   2. trm_wwan  Travelmate Wi-Fi uplink   metric 2
+#   3. cellular  FM350 cellular            metric 3
+#
+# These are UCI *network interface* names, not netdev names: mwan3 interface sections are
+# keyed on them, so nothing here mentions eth1/eth2/wwan0. Whatever device backs each
+# network is mwan3's concern via netifd, not ours.
+#
+# No `set -e`: `uci -q get`/`uci -q delete` on an absent key returns non-zero, which would
+# abort under set -e. Matches 99-h5000m-tailscale; every step is individually idempotent
+# because every section is *named* (mwan3.wan, mwan3.wan_m1_w3, ...), never anonymous, so
+# re-running just re-sets the same options in place.
+
+# --- one mwan3 interface (health-tracking) section -----------------------------------
+# WHY track_ip is public resolvers and not the gateway: the cellular link's "gateway" is
+# a point-to-point pseudo-gateway (the FM350 hands out a /32-ish PPP-style peer) that
+# never answers ICMP. Pinging the gateway would mark a perfectly working link down, so we
+# track reachable public IPs (Cloudflare, Google, Quad9) across every member instead.
+# reliability=1: a member is up if at least one of the three tracked IPs replies.
+mwan3_iface() {
+	_if="$1"
+	uci -q set "mwan3.${_if}=interface"
+	uci -q set "mwan3.${_if}.enabled=1"
+	uci -q set "mwan3.${_if}.family=ipv4"
+	uci -q delete "mwan3.${_if}.track_ip"
+	uci -q add_list "mwan3.${_if}.track_ip=1.1.1.1"
+	uci -q add_list "mwan3.${_if}.track_ip=8.8.8.8"
+	uci -q add_list "mwan3.${_if}.track_ip=9.9.9.9"
+	uci -q set "mwan3.${_if}.track_method=ping"
+	uci -q set "mwan3.${_if}.reliability=1"
+	uci -q set "mwan3.${_if}.count=1"
+	uci -q set "mwan3.${_if}.timeout=2"
+	uci -q set "mwan3.${_if}.interval=5"
+	uci -q set "mwan3.${_if}.down=3"
+	uci -q set "mwan3.${_if}.up=3"
+}
+
+# --- one mwan3 member (interface + failover metric) ----------------------------------
+# metric orders failover (lower = preferred); weight only matters between equal metrics,
+# which we never have, so it is cosmetic here.
+mwan3_member() {
+	_mid="$1"; _mif="$2"; _mmetric="$3"; _mweight="$4"
+	uci -q set "mwan3.${_mid}=member"
+	uci -q set "mwan3.${_mid}.interface=${_mif}"
+	uci -q set "mwan3.${_mid}.metric=${_mmetric}"
+	uci -q set "mwan3.${_mid}.weight=${_mweight}"
+}
+
+mwan3_iface wan
+mwan3_iface trm_wwan
+mwan3_iface cellular
+
+mwan3_member wan_m1_w3       wan       1 3
+mwan3_member trm_wwan_m2_w3  trm_wwan  2 3
+mwan3_member cellular_m3_w3  cellular  3 3
+
+# --- policy: strict failover in priority order ---------------------------------------
+# Distinct metrics on the members make this a failover chain (wired, then Wi-Fi, then
+# cellular), not a load-balance. last_resort=unreachable: if all three are down, drop
+# rather than leak onto the main routing table.
+uci -q set mwan3.balanced_or_failover=policy
+uci -q set mwan3.balanced_or_failover.last_resort=unreachable
+uci -q delete mwan3.balanced_or_failover.use_member
+uci -q add_list mwan3.balanced_or_failover.use_member=wan_m1_w3
+uci -q add_list mwan3.balanced_or_failover.use_member=trm_wwan_m2_w3
+uci -q add_list mwan3.balanced_or_failover.use_member=cellular_m3_w3
+
+# --- catch-all rule: send everything to the policy -----------------------------------
+uci -q set mwan3.default_rule=rule
+uci -q set mwan3.default_rule.dest_ip=0.0.0.0/0
+uci -q set mwan3.default_rule.family=ipv4
+uci -q set mwan3.default_rule.use_policy=balanced_or_failover
+
+uci -q commit mwan3
+
+exit 0

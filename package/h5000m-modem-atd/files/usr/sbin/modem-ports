@@ -1,0 +1,28 @@
+#!/bin/sh
+# modem-ports - show (or re-run) FM350 discovery. Read-only by default.
+#
+#   modem-ports            print the current state
+#   modem-ports --rescan   force a fresh probe, then print
+set -u
+
+. /usr/lib/h5000m/atio.sh
+. /usr/lib/h5000m/modem-discover.sh
+
+case "${1:-}" in
+	--rescan) modem_discover_locked || { echo "discovery failed" >&2; exit 1; } ;;
+	-h|--help) echo "usage: modem-ports [--rescan]"; exit 0 ;;
+esac
+
+at_state_load || { echo "no modem state; try: modem-ports --rescan" >&2; exit 1; }
+
+USBDEV=$(modem_find_usbdev) || USBDEV=""
+echo "usb path   : $MODEM_USBPATH"
+echo "sysfs      : ${USBDEV:-<gone>}"
+echo "AT port A  : $MODEM_AT_A  (interface $MODEM_AT_A_IF, dialer)"
+echo "AT port B  : $MODEM_AT_B  (interface $MODEM_AT_B_IF, atq/lpac/humans)"
+if [ "$MODEM_SINGLE_PORT" = 1 ]; then
+	echo "mode       : single AT port - every consumer takes the lock per transaction"
+else
+	echo "mode       : two AT ports - dialer and lease are independent"
+fi
+echo "data netdev: ${MODEM_NETDEV:-<none - is kmod-usb-net-rndis loaded?>}"

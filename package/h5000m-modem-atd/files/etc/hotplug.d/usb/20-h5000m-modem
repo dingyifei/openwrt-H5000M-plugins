@@ -1,0 +1,26 @@
+# Invalidate FM350 state when the modem itself leaves the bus.
+#
+# The tty rule handles individual port churn; this one handles the modem being
+# unplugged, reset, or re-enumerated as a whole. Removing the state file is
+# deliberate - a stale /dev/modem-at0 pointing at a recycled ttyUSB name is worse
+# than no symlink at all, because it fails silently instead of loudly.
+
+[ "$SUBSYSTEM" = "usb" ] || return 0
+
+. /usr/lib/h5000m/atio.sh
+. /usr/lib/h5000m/modem-discover.sh
+
+case "$ACTION" in
+	add)
+		(
+			sleep 3
+			modem_discover_locked
+		) >/dev/null 2>&1 &
+		;;
+	remove)
+		if ! modem_find_usbdev >/dev/null 2>&1; then
+			at_warn "FM350 left the USB bus; clearing modem state"
+			rm -f "$H5000M_MODEM_STATE" /dev/modem-at0 /dev/modem-at1
+		fi
+		;;
+esac

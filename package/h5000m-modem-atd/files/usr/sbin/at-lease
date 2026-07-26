@@ -1,0 +1,33 @@
+#!/bin/sh
+# at-lease - hold the leased AT port (B) and exec a foreign tool against it.
+#
+#   at-lease lpac chip info
+#   at-lease sh -c 'echo port is $MODEM_AT_B'
+#
+# The tool inherits MODEM_AT_B / MODEM_AT_A / MODEM_USBPATH in its environment, so it
+# never has to discover (or guess) a ttyUSB name. The lock is held for the tool's whole
+# lifetime, which is the point: lpac issues a long APDU conversation and must not be
+# interleaved with status polling.
+set -u
+
+. /usr/lib/h5000m/atio.sh
+. /usr/lib/h5000m/modem-discover.sh
+
+[ $# -ge 1 ] || { echo "usage: at-lease <command> [args...]" >&2; exit 4; }
+
+: "${AT_LEASE_WAIT:=30}"
+
+at_state_load || modem_discover_locked || { echo "at-lease: no modem" >&2; exit 1; }
+at_state_load || { echo "at-lease: no modem state" >&2; exit 1; }
+
+LOCK=$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_B_IF")
+mkdir -p "$H5000M_LOCKDIR"
+
+export MODEM_AT_A MODEM_AT_B MODEM_USBPATH MODEM_NETDEV
+
+# Put the port in a sane state before handing it over; lpac's AT backend assumes raw.
+at_port_setup "$MODEM_AT_B"
+
+exec 9>"$LOCK"
+at_flock_wait "$AT_LEASE_WAIT" || { echo "at-lease: AT port busy" >&2; exit 4; }
+exec "$@"

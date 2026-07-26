@@ -1,0 +1,75 @@
+#!/bin/sh
+# H5000M FM350 cellular defaults — idempotent.
+#
+# Creates the 'cellular' interface on the custom fm350 proto plus its firewall
+# membership. No credentials, no APN (blank is the correct default and is
+# self-correcting), and no netdev names anywhere — the whole point of the custom proto
+# is that the RNDIS device name never appears in configuration.
+#
+# No `set -e`: uci -q get on an absent key returns non-zero and would abort the script.
+
+# --- network.cellular ------------------------------------------------------------
+if [ "$(uci -q get network.cellular)" != 'interface' ]; then
+	uci -q set network.cellular=interface
+	uci -q set network.cellular.proto='fm350'
+	# Blank APN: requests the subscription default, which 3GPP guarantees the HSS
+	# supplies. Deliberately NOT 'internet' — that is a real APN on some networks and
+	# rejected on others, which would turn a working attach into a failure.
+	uci -q set network.cellular.apn=''
+	uci -q set network.cellular.pdp_type='IPV4V6'
+	# PDP context 1 is a hardware constraint on this modem, not a preference: RNDIS
+	# forwards traffic only on the initial bearer. Any other context yields an IP and
+	# then silently drops every packet.
+	uci -q set network.cellular.pdp_index='1'
+	# Verified on this unit (firmware 81600.0000.00.29.21.24): AT+CGAUTH returns an
+	# error, so PAP/CHAP is simply not expressible on this modem.
+	uci -q set network.cellular.auth='none'
+	# Also verified: AT+EIAAPN is rejected by this firmware, so there is no separate
+	# initial-EPS-bearer APN knob and AT+CGDCONT=1 is the only lever. Left off to save
+	# a pointless round-trip and a misleading log line; set to 1 if a firmware update
+	# ever adds it.
+	uci -q set network.cellular.set_attach_apn='0'
+	# Lowest-priority uplink by default; mwan3 owns real failover ordering.
+	uci -q set network.cellular.metric='20'
+	uci -q set network.cellular.auto='0'
+fi
+
+# --- 464xlat child ---------------------------------------------------------------
+# Needed wherever the grant is IPv6-only (T-Mobile US and friends): the FM350's Intel
+# XMM does not run CLAT itself, so without router-side CLAT IPv4 silently fails and
+# looks exactly like a wrong APN. Shipped with auto='0' because on a dual-stack or
+# IPv4-only grant it has nothing to do and would only generate log noise; enable it
+# with `uci set network.cellular_clat.auto=1` when the carrier is IPv6-only.
+if [ "$(uci -q get network.cellular_clat)" != 'interface' ]; then
+	uci -q set network.cellular_clat=interface
+	uci -q set network.cellular_clat.proto='464xlat'
+	uci -q set network.cellular_clat.tunlink='cellular'
+	uci -q set network.cellular_clat.auto='0'
+fi
+
+# --- firewall: cellular joins the wan zone (found by name, never by index) --------
+wan_zone=''
+for zone in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+	if [ "$(uci -q get "${zone}.name")" = 'wan' ]; then
+		wan_zone="$zone"
+		break
+	fi
+done
+
+if [ -n "$wan_zone" ]; then
+	for net in cellular cellular_clat; do
+		member=0
+		for cur in $(uci -q get "${wan_zone}.network"); do
+			[ "$cur" = "$net" ] && member=1
+		done
+		[ "$member" -eq 1 ] || uci -q add_list "${wan_zone}.network=${net}"
+	done
+	# Cellular links routinely carry a sub-1500 MTU; without MSS clamping, large TCP
+	# segments black-hole in a way that looks like a broken uplink.
+	uci -q set "${wan_zone}.mtu_fix=1"
+fi
+
+uci -q commit network
+uci -q commit firewall
+
+exit 0

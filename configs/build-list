@@ -1,4 +1,12 @@
 # Packages built from this repo, one name per line (each maps to package/<name>/).
 # Blank lines and lines starting with '#' are ignored. configure-sdk.sh seeds exactly these
 # as CONFIG_PACKAGE_<name>=m; build-packages.sh builds each, in order, and signs it.
+#
+# Order matters: h5000m-modem-atd supplies the AT layer that h5000m-fm350 and
+# h5000m-lpac depend on, so it is built first.
+h5000m-modem-atd
+h5000m-fm350
+h5000m-lpac
 h5000m-travelmate-defaults
+h5000m-tailscale-defaults
+h5000m-mwan3-policy

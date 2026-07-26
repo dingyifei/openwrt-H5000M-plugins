@@ -1,0 +1,53 @@
+#!/bin/sh
+# H5000M Tailscale defaults — idempotent first-boot firewall wiring.
+# Ships LOGGED OUT: no auth key is written and `tailscale up` is never run; the service,
+# if enabled elsewhere, comes up unauthenticated.
+#
+# No `set -e`: uci -q get on an absent key returns non-zero, which would abort the
+# script under set -e. Matches 90-h5000m-base; each step below is individually idempotent.
+
+# --- Firewall zone 'tailscale' over the tailscale0 tun device (found by name). --
+ts_zone=''
+for zone in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=zone$/\1/p'); do
+	if [ "$(uci -q get "${zone}.name")" = 'tailscale' ]; then
+		ts_zone="$zone"
+		break
+	fi
+done
+if [ -z "$ts_zone" ]; then
+	ts_zone="firewall.$(uci add firewall zone)"
+	uci -q set "${ts_zone}.name=tailscale"
+fi
+uci -q set "${ts_zone}.input=ACCEPT"
+uci -q set "${ts_zone}.output=ACCEPT"
+uci -q set "${ts_zone}.forward=ACCEPT"
+uci -q set "${ts_zone}.masq=0"
+uci -q set "${ts_zone}.mtu_fix=0"
+
+# tailscale0 is a tun device with no OpenWrt network interface, so bind it to the zone
+# by device (list form) rather than by network. Idempotent membership check.
+have_dev=0
+for dev in $(uci -q get "${ts_zone}.device"); do
+	[ "$dev" = 'tailscale0' ] && have_dev=1
+done
+[ "$have_dev" -eq 1 ] || uci -q add_list "${ts_zone}.device=tailscale0"
+
+# --- Forwarding both ways between tailscale and lan (found by src+dest). --------
+ensure_forwarding() {
+	fwd_src="$1"
+	fwd_dest="$2"
+	for fwd in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+		[ "$(uci -q get "${fwd}.src")" = "$fwd_src" ] || continue
+		[ "$(uci -q get "${fwd}.dest")" = "$fwd_dest" ] || continue
+		return 0
+	done
+	new_fwd="firewall.$(uci add firewall forwarding)"
+	uci -q set "${new_fwd}.src=${fwd_src}"
+	uci -q set "${new_fwd}.dest=${fwd_dest}"
+}
+ensure_forwarding tailscale lan
+ensure_forwarding lan tailscale
+
+uci -q commit firewall
+
+exit 0

@@ -115,6 +115,13 @@ FEEDS_LOCK_SHA="$(sha256_hex < "${ROOT_DIR}/configs/feeds.lock")"
 
 # --- 4. feeds update/install ---
 echo ">> [4/6] feeds update -a && feeds install -a (this clones the pinned feeds; slow)"
+# Drop the cached index for our own src-link feed first. `feeds update` does NOT rescan a
+# src-link whose directory it has already indexed, so on an incremental run every package
+# added to package/ since the last configure stays invisible: it never reaches the index,
+# never gets symlinked by `feeds install`, and never appears as a kconfig symbol. The
+# [6/6] assertion catches it, but only after a long feed clone. Removing the index makes
+# the rescan unconditional and costs nothing (it is generated from a local directory).
+rm -f "${SDK}/feeds/h5000m.index" "${SDK}/feeds/h5000m.targetindex"
 ( cd "${SDK}" && ./scripts/feeds update -a )
 ( cd "${SDK}" && ./scripts/feeds install -a )
 

@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=h5000m-travelmate-defaults
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_MAINTAINER:=H5000M
 PKG_LICENSE:=GPL-2.0-or-later
@@ -21,8 +21,9 @@ endef
 
 define Package/h5000m-travelmate-defaults/description
   First-boot defaults for Travelmate on the H5000M: normalize exactly one disabled
-  mode='sta' Wi-Fi interface bound to a trm_wwan network owned by Travelmate. Idempotent;
-  preserves the base's discovered AP sections; contains no upstream SSID or PSK.
+  mode='sta' Wi-Fi interface bound to a trm_wwan network owned by Travelmate, create the
+  trm_wwan DHCP interface, and add it to the wan firewall zone. Idempotent; preserves the
+  base's discovered AP sections; contains no upstream SSID or PSK.
 endef
 
 define Build/Compile

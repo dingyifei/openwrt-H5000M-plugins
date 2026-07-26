@@ -1,0 +1,57 @@
+#!/bin/sh
+# atq - run one AT command on the leased port (B). Never touches the dialer's port.
+#
+#   atq 'AT+CSQ'            query signal
+#   atq -t 10 'AT+CGACT?'   with an explicit timeout
+#
+# Exit: 0 OK, 2 modem returned ERROR, 3 timeout, 4 refused, 1 no modem.
+set -u
+
+. /usr/lib/h5000m/atio.sh
+. /usr/lib/h5000m/modem-discover.sh
+
+TIMEOUT=5
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-t) TIMEOUT="$2"; shift 2 ;;
+		-h|--help)
+			echo "usage: atq [-t seconds] 'AT+COMMAND'"
+			exit 0
+			;;
+		--) shift; break ;;
+		-*) echo "atq: unknown option $1" >&2; exit 4 ;;
+		*) break ;;
+	esac
+done
+
+[ $# -ge 1 ] || { echo "usage: atq [-t seconds] 'AT+COMMAND'" >&2; exit 4; }
+CMD="$1"
+
+# Commands that either block the port for minutes or belong exclusively to the
+# dialer's state machine. Refusing them here is what keeps a casual query from
+# wedging the modem for everyone - the vendor firmware's single semaphore had no
+# such guard and a stray AT+COPS=? would stall the whole stack.
+case "$(echo "$CMD" | tr 'a-z' 'A-Z' | tr -d ' ')" in
+	AT+COPS=?*)
+		echo "atq: refusing AT+COPS=? - a network scan blocks this port for minutes" >&2
+		exit 4
+		;;
+	AT+CFUN=*)
+		echo "atq: refusing AT+CFUN= - radio state belongs to the dialer" >&2
+		exit 4
+		;;
+	AT+CGDCONT=1,*)
+		echo "atq: refusing AT+CGDCONT=1, - PDP context 1 belongs to the dialer" >&2
+		exit 4
+		;;
+esac
+
+at_state_load || modem_discover_locked || { echo "atq: no modem" >&2; exit 1; }
+at_state_load || { echo "atq: no modem state" >&2; exit 1; }
+
+LOCK=$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_B_IF")
+
+at_locked "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$CMD" "$TIMEOUT"
+rc=$?
+[ "$rc" = 4 ] && echo "atq: AT port busy" >&2
+exit "$rc"
