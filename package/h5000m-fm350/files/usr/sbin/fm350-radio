@@ -288,11 +288,11 @@ apply_cell() {
 	_ac_prev_cell=$(at_one 'AT+EMMCHLCK?' 10 | sed -n 's/^+EMMCHLCK: *//p' | head -1)
 	[ -n "$_ac_prev_cell" ] || _ac_prev_cell=0
 
-	# Captured BEFORE any RAT change, for the reason in read_gtact().
-	_ac_prev_act=$(read_gtact)
-	[ -n "$_ac_prev_act" ] || { say failed 'could not read the current band configuration'; return 1; }
-
-	# An empty ARFCN means unlock.
+	# An empty ARFCN means unlock. Handled BEFORE reading the band configuration: unlock
+	# restores from $PREVACT and never looks at the current value, so reading it here would
+	# spend up to three AT+GTACT? retries on the shared port and - worse - could refuse to
+	# unlock with "could not read the current band configuration" over a value it discards.
+	# Refusing to UNLOCK is the one failure this path must not have.
 	if [ -z "${CELL_ARFCN:-}" ]; then
 		say applying 'clearing the cell lock'
 		iface_down
@@ -322,6 +322,11 @@ apply_cell() {
 		say failed 'cell lock cleared but no data bearer came back'
 		return 1
 	fi
+
+	# Captured BEFORE any RAT change, for the reason in read_gtact(). Only the lock path
+	# needs it, which is why it sits below the unlock branch.
+	_ac_prev_act=$(read_gtact)
+	[ -n "$_ac_prev_act" ] || { say failed 'could not read the current band configuration'; return 1; }
 
 	say applying "AT+EMMCHLCK=1,7,0,${CELL_ARFCN},${CELL_PCI}"
 	log_info 'locking to earfcn %s pci %s (lte_only=%s)' \

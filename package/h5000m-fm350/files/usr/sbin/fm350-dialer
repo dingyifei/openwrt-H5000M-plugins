@@ -290,15 +290,18 @@ at 'AT+CGEREP=2,1' 6 >/dev/null 2>&1
 REG_WAIT=90
 _reg_left="$REG_WAIT"
 while [ "$_reg_left" -gt 0 ]; do
-	case "$(at 'AT+CEREG?' 6)" in
-		*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) break ;;
-		*"+CEREG: 0,3"*)
-			warn "network DENIED registration - check the SIM subscription"
-			proto_notify_error "$INTERFACE" REGISTRATION_DENIED
-			proto_block_restart "$INTERFACE"
-			exit 1
-			;;
-	esac
+	# at_reg_ok/at_reg_denied from atio.sh, NOT an inline case. The band/cell guard judges
+	# success with the same two helpers; if this loop kept its own copy the two could drift,
+	# and the guard would then revert a configuration this dialer is perfectly happy with -
+	# which is the exact failure those helpers were added to prevent.
+	_reg_out=$(at 'AT+CEREG?' 6)
+	at_reg_ok "$_reg_out" && break
+	if at_reg_denied "$_reg_out"; then
+		warn "network DENIED registration - check the SIM subscription"
+		proto_notify_error "$INTERFACE" REGISTRATION_DENIED
+		proto_block_restart "$INTERFACE"
+		exit 1
+	fi
 	_reg_left=$(( _reg_left - 5 ))
 	sleep 5
 done
