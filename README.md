@@ -108,23 +108,35 @@ export H5000M_BASE_ARTIFACT=../openwrt-H5000M/artifacts/H5000M-official-base-<re
 Substitute any feature-set name for `travelmate`: `cellular`, `esim`, `tailscale`,
 `mwan3`, or `all` (see `configs/feature-sets.conf`).
 
-## Stage 2 — feature packages (2026-07-26)
+## Stage 2 — feature packages (updated 2026-07-27)
 
-Six config/script-only packages, all `PKGARCH:=all`, no credentials:
+Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
 
 | Package | Provides |
 |---|---|
 | `h5000m-modem-atd` | FM350 AT broker: sysfs discovery, `atq`, `at-lease`, `modem-ports`, hotplug rules |
 | `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface |
 | `h5000m-lpac` | `h5000m-esim` — lpac over its AT backend, under the port lease |
+| `h5000m-sms` | `h5000m-sms` — `sms_tool` under the port lease; no PDU codec of our own |
+| `luci-proto-fm350` | LuCI handler so the `cellular` interface is editable in the web UI |
+| `luci-app-fm350` | Network → FM350: status, SMS, and recovery actions |
 | `h5000m-travelmate-defaults` | one disabled STA VIF → `trm_wwan` |
 | `h5000m-tailscale-defaults` | `tailscale0` firewall zone, shipped logged out |
 | `h5000m-mwan3-policy` | wan → trm_wwan → cellular failover, public-IP tracking |
 
-`tests/test-plugin-invariants.sh` enforces the rules that were learned the hard way on
+Two host-side suites, both negative-controlled — injecting each violation makes them fail:
+
+`tests/test-plugin-invariants.sh` (31 checks) enforces rules learned the hard way on
 hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -w`
 (busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
-credentials. It has been negative-controlled — injecting each violation makes it fail.
+credentials, no anonymous `wifi-iface` sections, LuCI protocol handlers must `return` the
+registered class, and rpcd backends must take no direct serial access, set `AT_PRIO=1`,
+live in `/usr/share/rpcd/ucode`, and reload rpcd in postinst.
+
+`tests/test-log-library.sh` (21 checks) unit-tests the logging library with `uci` and
+`logger` stubbed, so it needs no device. The redaction assertions grep for the actual
+IMSI/EID/ICCID/PDU rather than for the mask — a privacy control has to be proven, not
+eyeballed.
 
 ### Build cost: why these packages use `EXTRA_DEPENDS`
 
@@ -168,11 +180,37 @@ closure into the actual rootfs with `--network none` and asserts it equals
   only thing that catches it is `verify-offline-install.sh` - and only for feature sets we
   actually verify. **Verify the `all` set in CI** so every package's dependencies are
   exercised, or this hole stays open for the unverified ones.
-- ⛔ FM350 end-to-end attach is blocked by the **SIM**, not by code: the fitted SIM is
-  refused by the network (`+CEREG: 0,3`, registration denied) even when forced to its home
-  PLMN. Everything up to and including APN programming works.
+- ✅ **Cellular works end to end and comes up unattended at boot.** The earlier note here
+  said attach was blocked by the SIM — that was true of the SIM then fitted and is no
+  longer the situation. See `../openwrt-H5000M/FM350-GL-SETUP.md` for what actually made
+  it work: exactly one active PDP context, `+EAPNACT` rather than `+CGACT`, and `arp off`
+  on the RNDIS netdev.
+- ✅ **AT priority, batch mode, logging and the web UI verified on hardware.** Priority 30
+  waited 1 s against five competing pollers where priority 1 waited 11 s; `atq -b` runs
+  four commands in 1.07 s under one lock; trace-level redaction was checked against the
+  real 15-digit IMSI; all seven `luci.fm350` ubus methods answer with live data.
+- ⚠️ **The eUICC exists but lpac cannot reach it.** `AT+EID` returns a real EID and the
+  card reports `EMPTY_EUICC`, but `AT+CCHO` to the ISD-R AID is refused on both SIM slots
+  and the `at_csim` backend is not compiled into the packaged lpac.
+
+### Usage
+
+```sh
+modem-ports                              # discovered ports and the data netdev
+modem-ports --rescan                     # re-probe after a re-enumeration
+atq 'AT+CSQ'                             # one AT command
+atq -b 'AT+CESQ' 'AT+COPS?'              # several, under ONE lock acquisition
+at-lease lpac chip info                  # hand the port to a foreign tool
+h5000m-sms -j recv                       # inbox as JSON
+h5000m-sms send 10086 '余额'              # send
+
+uci set h5000m.logging.fm350=trace       # error|warn|info|debug|trace, per component
+uci commit h5000m                        # long-lived processes need a restart to notice
+h5000m-log-capture 120 fm350=trace       # bounded capture to /tmp, reverted on exit
+```
 
 ### Next
 
-Third-party source builds (`luci-app-epm`, PassWall2) remain deferred;
-`configs/sources.lock` is empty and `build-packages.sh` fails loudly if it is not.
+Third-party source builds (PassWall2 and friends) remain deferred; `configs/sources.lock`
+is empty and `build-packages.sh` fails loudly if it is not. The in-feed `luci-app-v2raya`
+covers the proxy case without one.
