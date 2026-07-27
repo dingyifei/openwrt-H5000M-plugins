@@ -1,4 +1,5 @@
-// Unit tests for group_messages() in the luci.fm350 rpcd backend.
+// Unit tests for the shared SMS grouping module
+// (package/h5000m-modem-atd/files/usr/share/ucode/h5000m/sms_grouping.uc).
 //
 // Concatenated-SMS reassembly is pure data transformation, so it is testable without a modem.
 // The tests below are the cases that actually bit, not hypotheticals:
@@ -10,51 +11,37 @@
 //   - segments whose SMSC timestamps differ, which is the normal case and the reason
 //     luci-app-sms-tool-js's timestamp-keyed grouping is fragile;
 //   - an incomplete group, which must still render rather than vanish;
-//   - a standalone message, which carries no reference/part/total at all.
+//   - a standalone message, which carries no reference/part/total at all;
+//   - the timestamp comparator, since the live view sorts newest-first and the archiver
+//     oldest-first through this ONE function, and the format is NOT lexically sortable.
 //
-// Rather than duplicating the function here (a copy would drift and then pass while the
-// shipped code was broken), this loads the REAL backend source and evaluates it with its
-// tail replaced so the helper is returned instead of the ubus object.
+// The module is a pure library (no fs, no ubus) loaded exactly the way the real consumers
+// load it - loadfile() then call - so the test exercises the shipped artifact, not a copy
+// that could drift and pass while the real code was broken.
 //
 // Usage: ucode tests/test-sms-grouping.uc [repo-root]
 //
-// ⚠️ WHERE THIS RUNS: on the router, or any OpenWrt target - NOT in host CI and not on macOS.
-// It is not laziness: the backend it loads does `import ... from 'ubus'`, so compiling it
-// requires libubus, and there is no `ucode` package in Ubuntu 24.04 either (checked). Rather
-// than let the suite "skip" - which reads exactly like a pass, and this repo has already
-// shipped one vacuous test - the dependency is stated plainly. Run it with:
+// ⚠️ WHERE THIS RUNS: anywhere the `ucode` binary exists - the router, or a dev box with
+// ucode installed. It no longer needs libubus (the old version loaded the whole rpcd backend,
+// which imports 'ubus'); the pure module compiles standalone. There is still no `ucode`
+// package in Ubuntu 24.04 or on macOS, so host CI runs it only where ucode is available.
+// Rather than let the suite "skip" - which reads exactly like a pass, and this repo has
+// already shipped one vacuous test - the dependency is stated plainly. Run it with:
 //
 //   scp -r package tests root@<router>:/tmp/t/ && ssh root@<router> \
 //     'cd /tmp/t && ucode tests/test-sms-grouping.uc /tmp/t'
 
 let root = length(ARGV) > 0 ? ARGV[0] : '.';
-let src_path = `${root}/package/luci-app-fm350/root/usr/share/rpcd/ucode/luci.fm350`;
+let mod_path = `${root}/package/h5000m-modem-atd/files/usr/share/ucode/h5000m/sms_grouping.uc`;
 
-// require() rather than `import { open } from 'fs'` - import needs the script to be loaded as
-// a module, and this runs as a plain script so that `ucode tests/...` just works.
-let fs = require('fs');
-let fh = fs.open(src_path, 'r');
-if (!fh) {
-	warn(`cannot open ${src_path}\n`);
+let factory = loadfile(mod_path);
+if (!factory) {
+	warn(`cannot load ${mod_path}\n`);
 	exit(1);
 }
-let src = fh.read('all');
-fh.close();
-
-// Swap the module's tail so we get the helper rather than { 'luci.fm350': methods }.
-let marker = "return { 'luci.fm350': methods };";
-if (index(src, marker) < 0) {
-	warn("the backend's export line changed - update this test's marker\n");
-	exit(1);
-}
-src = replace(src, marker, 'return { group_messages };');
-
-let mod = loadstring(src);
-if (!mod) {
-	warn('failed to compile the backend source\n');
-	exit(1);
-}
-let group_messages = mod().group_messages;
+let mod = factory();
+let group_messages = mod.group_messages;
+let cmp_timestamp = mod.cmp_timestamp;
 
 let checks = 0, fails = 0;
 function ok(msg) { checks++; print(`  [PASS] ${msg}\n`); }
@@ -130,6 +117,19 @@ eq(r[0].complete, false, 'a group containing an undecodable segment is not compl
 print("== empty input ==\n");
 r = group_messages([]);
 eq(length(r), 0, 'empty list yields no messages');
+
+print("== cmp_timestamp orders chronologically, not lexically ==\n");
+// The trap: as strings, "12/01/25" < "07/27/26", but Dec 2025 is EARLIER than Jul 2026.
+eq(cmp_timestamp('12/01/25 08:00:00', '07/27/26 23:30:19') < 0, true,
+   'Dec 2025 sorts before Jul 2026 despite lexical order saying otherwise');
+eq(cmp_timestamp('07/27/26 23:30:19', '07/27/26 23:30:18') > 0, true,
+   'later second sorts after earlier second');
+eq(cmp_timestamp('07/27/26 23:30:19', '07/27/26 23:30:19') == 0, true,
+   'identical timestamps compare equal');
+eq(cmp_timestamp('03/09/26 05:00:00', '03/10/26 04:00:00') < 0, true,
+   'earlier day sorts first even when its clock time is later');
+// Unparseable input must not throw - deterministic fallback, null before any string.
+eq(cmp_timestamp(null, 'anything') < 0, true, 'null timestamp sorts before a string, no crash');
 
 print(`\nchecks=${checks} failures=${fails}\n`);
 if (fails > 0)

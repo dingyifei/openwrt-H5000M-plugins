@@ -1,0 +1,262 @@
+#!/usr/bin/ucode
+// One full archive pass. Invoked once per wake cycle by the h5000m-sms-archive service, which
+// has already checked `enabled` and exported AT_PRIO=5 (so every h5000m-sms call below runs
+// below any user action but above the cosmetic status poll).
+//
+// TWO PHASES, in order:
+//   1. RESUME/RECONCILE - finish any archive entry left with delete_confirmed=false by a
+//      previous (possibly crashed) run.
+//   2. ARCHIVE-NEW - if the modem store is at/over threshold, copy the oldest logical messages
+//      to the archive and delete their modem slots.
+//
+// The invariant that makes a crash safe: the archive entry is written (delete_confirmed=false)
+// BEFORE any modem slot is deleted. A crash between the two can therefore only leave a
+// duplicate-SAFE pending entry - phase 1 next cycle finishes it - never a message that was
+// deleted from the modem without a durable copy.
+//
+// COLLISION SAFETY is the subtlest property. AT storage indices are REUSED once a slot frees,
+// so an index recorded in the archive may later hold a completely different, newly-arrived
+// message. Every "is this fragment still here?" check therefore matches on
+// (index, sender, timestamp) TOGETHER, never index alone - see frag_present().
+
+'use strict';
+
+import { readfile, writefile, rename, popen } from 'fs';
+
+const grouping = loadfile('/usr/share/ucode/h5000m/sms_grouping.uc')();
+
+function run(cmd) {
+	const fd = popen(cmd, 'r');
+	if (!fd) return null;
+	const out = fd.read('all');
+	fd.close();
+	return out;
+}
+
+function uci_get(opt, dflt) {
+	const v = trim(run(`uci -q get h5000m.sms_archive.${opt}`) ?? '');
+	return v != '' ? v : dflt;
+}
+
+function to_int(v, dflt) {
+	if (type(v) != 'string' || !match(v, /^[0-9]+$/)) return dflt;
+	return +v;
+}
+
+// A record, NOT a timeout: this board has no RTC and the clock steps at boot, so archived_at
+// may read as the image build date until ntp corrects it. That is fine for a stored timestamp;
+// nothing derives a deadline from it. Built from ucode's gmtime (mon 1-12, full year) rather
+// than a wall-clock epoch, which the invariants suite forbids anywhere timing loops live.
+function iso_now() {
+	const t = gmtime(time());
+	if (!t) return '';
+	return sprintf('%04d-%02d-%02dT%02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec);
+}
+
+const STORAGE   = uci_get('storage_path', '/etc/h5000m/sms-archive.json');
+const THRESHOLD = to_int(uci_get('threshold', '70'), 70);
+const BATCH     = to_int(uci_get('batch_size', '10'), 10);
+const MAXMSG    = to_int(uci_get('max_messages', '0'), 0);
+
+// --- archive file ---------------------------------------------------------------------------
+
+function load_archive() {
+	const raw = readfile(STORAGE);
+	if (raw == null || raw == '')
+		return { next_id: 1, messages: [] };
+	let doc = null;
+	try { doc = json(raw); } catch (e) { doc = null; }
+	if (type(doc) != 'object') return { next_id: 1, messages: [] };
+	if (type(doc.messages) != 'array') doc.messages = [];
+	if (type(doc.next_id) != 'int') doc.next_id = 1;
+	return doc;
+}
+
+// Atomic: write a sibling temp file then rename over the target. rename() within one directory
+// is atomic, so a concurrent reader (the LuCI backend) never sees a half-written file. Returns
+// true on success.
+function save_archive(doc) {
+	const tmp = STORAGE + '.tmp';
+	if (writefile(tmp, sprintf('%J', doc)) == null)
+		return false;
+	return !!rename(tmp, STORAGE);
+}
+
+// --- modem snapshot -------------------------------------------------------------------------
+
+function recv() {
+	const out = run('/usr/sbin/h5000m-sms -j recv 2>/dev/null');
+	let msgs = [];
+	try { msgs = json(out)?.msg ?? []; } catch (e) { msgs = []; }
+	return type(msgs) == 'array' ? msgs : [];
+}
+
+function used_count() {
+	const s = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
+	const m = match(s, /used:\s*([0-9]+)/);
+	return m ? +m[1] : null;
+}
+
+// slot index -> the raw fragment currently in it, for collision-safe presence checks.
+function index_map(msgs) {
+	const map = {};
+	for (let m in msgs)
+		if (m.index != null)
+			map['' + m.index] = m;
+	return map;
+}
+
+// A recorded fragment is "still the same message" only if the slot currently holds a fragment
+// with the SAME sender AND timestamp. Index alone is not enough: the slot may have been recycled
+// to an unrelated message since we archived, and deleting THAT would be data loss.
+function frag_present(map, frag) {
+	const cur = map['' + frag.index];
+	if (cur == null) return false;
+	return (cur.sender == frag.sender) && (cur.timestamp == frag.timestamp);
+}
+
+function del_slot(idx) {
+	const out = run(`/usr/sbin/h5000m-sms delete ${+idx} 2>&1`) ?? '';
+	return !match(out, /[Ee]rror|ERROR|failed/);
+}
+
+// Delete every still-present fragment of an entry. Returns true when the entry is fully
+// accounted for - each fragment either absent (already gone) or deleted successfully now.
+function settle_entry(entry, map) {
+	let all_gone = true;
+	for (let f in (entry.fragments ?? [])) {
+		if (frag_present(map, f)) {
+			if (!del_slot(f.index))
+				all_gone = false;   // failed; a later cycle retries (frag stays present)
+		}
+		// not present -> already gone (deleted earlier, or slot recycled): leave it be
+	}
+	return all_gone;
+}
+
+// --- main pass ------------------------------------------------------------------------------
+
+let archived = 0, reconciled = 0, pending = 0;
+
+const doc = load_archive();
+
+const used = used_count();
+const msgs = recv();
+
+// Conservative gate. If status did not parse, or the recv snapshot disagrees with the reported
+// used-count (a message arrived mid-read, or recv failed and returned empty), do NOTHING this
+// cycle. A stale/empty snapshot would make frag_present() answer "gone" for fragments that are
+// actually still on the modem, which would falsely confirm - or worse, skip - real work. The
+// next cycle retries with a fresh, consistent snapshot; skipping one interval costs nothing.
+if (used == null) {
+	warn('h5000m-sms status did not report a used-count; skipping this cycle\n');
+	exit(0);
+}
+if (length(msgs) != used) {
+	warn(sprintf('snapshot inconsistent (status used=%d, recv=%d); skipping this cycle\n',
+	             used, length(msgs)));
+	exit(0);
+}
+
+const map = index_map(msgs);
+
+// Signatures of fragments belonging to entries we have ALREADY archived but not finished
+// deleting. Captured HERE, before phase 1 flips any of them to confirmed, because a message
+// reconciled this cycle is still present in `msgs` (the snapshot predates phase 1's deletes) -
+// and if it were not excluded, phase 2 would archive it a SECOND time. Fragment identity is
+// (sender, timestamp), the same pair collision-safe deletion keys on.
+const already_sig = {};
+for (let e in doc.messages)
+	if (!e.delete_confirmed)
+		for (let f in (e.fragments ?? []))
+			already_sig[`${f.sender ?? ''}|${f.timestamp ?? ''}`] = true;
+
+// Phase 1: reconcile pending entries against the fresh snapshot.
+for (let e in doc.messages) {
+	if (e.delete_confirmed) continue;
+	if (settle_entry(e, map)) {
+		e.delete_confirmed = true;
+		reconciled++;
+	} else {
+		pending++;
+	}
+}
+if (reconciled > 0 && !save_archive(doc)) {
+	warn('could not persist reconciled archive; aborting before archiving new messages\n');
+	exit(1);
+}
+
+// Phase 2: archive new messages if the store is at/over threshold.
+if (used >= THRESHOLD && length(msgs) > 0) {
+	// Group the snapshot into logical messages, oldest first (same comparator the live view
+	// sorts newest-first with).
+	const groups = grouping.group_messages(msgs);
+	sort(groups, function(a, b) { return grouping.cmp_timestamp(a.timestamp, b.timestamp); });
+
+	let taken = 0;
+	for (let g in groups) {
+		if (taken >= BATCH) break;
+
+		// Build the fragment triples from the raw snapshot: each slot's own sender/timestamp,
+		// which is what collision-safe deletion later matches on. Segments of one message can
+		// carry timestamps a second apart, so this must be per-fragment, not the group's.
+		const frags = [];
+		let dup = false;
+		for (let ix in g.indexes) {
+			const rawf = map['' + ix];
+			const sender = rawf?.sender ?? g.sender;
+			const ts = rawf?.timestamp ?? g.timestamp;
+			if (already_sig[`${sender ?? ''}|${ts ?? ''}`]) { dup = true; break; }
+			push(frags, { index: ix, sender: sender, timestamp: ts });
+		}
+		if (dup) continue;   // already archived and awaiting deletion; phase 1 handles its slots
+
+		const entry = {
+			id: sprintf('%d', doc.next_id),
+			sender: g.sender, timestamp: g.timestamp, content: g.content,
+			complete: g.complete, error: g.error ?? null,
+			parts: g.parts, total: g.total,
+			fragments: frags,
+			delete_confirmed: false,
+			archived_at: iso_now()
+		};
+		doc.next_id += 1;
+		push(doc.messages, entry);
+
+		// ARCHIVE BEFORE DELETE. Persist the durable copy first; only then touch the modem.
+		if (!save_archive(doc)) {
+			warn('could not persist a new archive entry; leaving its modem slots intact\n');
+			break;
+		}
+		if (settle_entry(entry, map)) {
+			entry.delete_confirmed = true;
+			save_archive(doc);
+		} else {
+			pending++;
+		}
+		archived++;
+		taken++;
+	}
+}
+
+// Pruning: only when a cap is set (default 0 = unbounded). Drop the oldest CONFIRMED entries
+// beyond the cap - never a pending one, whose modem slots may still exist and whose archive
+// entry is then the only durable copy.
+if (MAXMSG > 0 && length(doc.messages) > MAXMSG) {
+	const over = length(doc.messages) - MAXMSG;
+	const confirmed = filter(doc.messages, function(e) { return e.delete_confirmed; });
+	if (over > 0 && length(confirmed) > 0) {
+		sort(confirmed, function(a, b) { return grouping.cmp_timestamp(a.timestamp, b.timestamp); });
+		const drop = slice(confirmed, 0, min(over, length(confirmed)));
+		const dropids = {};
+		for (let d in drop) dropids[d.id] = true;
+		doc.messages = filter(doc.messages, function(e) { return !dropids[e.id]; });
+		save_archive(doc);
+	}
+}
+
+if (archived > 0 || reconciled > 0)
+	print(sprintf('sms-archive: reconciled %d, archived %d, pending %d, store used %d/%d\n',
+	              reconciled, archived, pending, used, THRESHOLD));
+
+exit(0);

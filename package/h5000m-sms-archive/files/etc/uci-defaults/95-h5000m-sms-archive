@@ -1,0 +1,39 @@
+#!/bin/sh
+# Seed the sms_archive UCI section and its logging component.
+#
+# On a FRESH install these already ship in h5000m-modem-atd's /etc/config/h5000m. But OpenWrt
+# preserves a modified /etc/config across upgrades, so a box that had h5000m-modem-atd before
+# this feature existed will not get the new section from the shipped file - this script adds it.
+# Every write is guarded by `uci -q get` so re-running (or running after the shipped file already
+# provided it) changes nothing. No `set -e`: a single failed read must not abort the rest.
+
+CFG=h5000m
+
+# The named section itself. Anonymous would defeat the whole point - callers reference it by
+# name (h5000m.sms_archive.*).
+if [ "$(uci -q get ${CFG}.sms_archive)" != 'sms_archive' ]; then
+	uci -q set ${CFG}.sms_archive='sms_archive'
+fi
+
+seed() {
+	# seed <option> <default> - only sets when the option is absent, so an operator's change survives.
+	[ -n "$(uci -q get ${CFG}.sms_archive.$1)" ] || uci -q set ${CFG}.sms_archive.$1="$2"
+}
+
+seed enabled '0'
+seed threshold '70'
+seed batch_size '10'
+seed interval '900'
+seed storage_path '/etc/h5000m/sms-archive.json'
+seed max_messages '0'
+
+# Logging component key. Empty string = inherit the global level; the point is only that the key
+# EXISTS so `uci set h5000m.logging.sms_archive=debug` has something to set. `uci -q get` prints
+# nothing whether the key is absent OR set to '', so `uci -q show` is what distinguishes them.
+if ! uci -q show ${CFG}.logging.sms_archive >/dev/null 2>&1; then
+	uci -q set ${CFG}.logging.sms_archive=''
+fi
+
+uci -q commit ${CFG}
+
+exit 0

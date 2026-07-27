@@ -10,7 +10,7 @@
 #   trace  the AT wire itself: every command and response
 #
 # Per-component keys override the global level. Components: fm350 (dialer),
-# modem_atd (AT layer), sms, esim. Leave empty to inherit.
+# modem_atd (AT layer), sms, esim, sms_archive (the FIFO archiver). Leave empty to inherit.
 #
 #   uci set h5000m.logging.fm350=trace; uci commit h5000m
 #
@@ -29,6 +29,9 @@ config logging 'logging'
 	option modem_atd ''
 	option sms ''
 	option esim ''
+	# The router-side SMS FIFO archiver (h5000m-sms-archive). Read once at process start,
+	# like the others - changing it needs `/etc/init.d/h5000m-sms-archive restart`.
+	option sms_archive ''
 	# The LuCI backend. It logs through the same library as everything else - a new
 	# component must not be the one thing that bypasses it.
 	option ui ''
@@ -43,3 +46,26 @@ config logging 'logging'
 	# This is a repeat COUNT, not a time window: taking a timestamp per line would cost a
 	# fork per log call, which is the thing this library is built to avoid.
 	option dedup_max '50'
+
+# Router-side SMS FIFO archive (package h5000m-sms-archive). The modem's SMS store is tiny
+# (~90 slots observed) and silently rejects new messages once full. When enabled, this copies
+# the oldest messages to persistent router storage and deletes them from the modem so the store
+# never fills; the LuCI inbox then shows archived + live messages merged by time.
+config sms_archive 'sms_archive'
+	# Off by default: this deletes real messages from the modem once archived, and the
+	# grouping/delete fix is new. Turn on once you have confirmed it on your hardware.
+	option enabled '0'
+	# Modem 'used' count (SEGMENTS, not logical messages) that triggers a sweep. ~90 slots
+	# observed on this unit; leave headroom below the LuCI 80%-full warning.
+	option threshold '70'
+	# Oldest LOGICAL messages archived+deleted per wake cycle (frees >= this many physical
+	# slots - more if any are multipart). Kept small and bounded so one cycle's AT-port
+	# occupancy stays predictable; if still over threshold, the next cycle just runs again.
+	option batch_size '10'
+	# Seconds between wake cycles. Re-read every cycle, takes effect on the next one.
+	option interval '900'
+	option storage_path '/etc/h5000m/sms-archive.json'
+	# 0 = unbounded (default). Set >0 to cap the archive and prune the oldest CONFIRMED
+	# entries first once it is full. Router flash is finite and this file also inflates every
+	# future backup, so consider a cap once you know how much history you want kept.
+	option max_messages '0'

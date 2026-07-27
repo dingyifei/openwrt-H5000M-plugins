@@ -23,6 +23,12 @@ for f in $(find "$PKGDIR" -type f \
 		\( -path '*/files/usr/sbin/*' -o -path '*/files/usr/lib/*' \
 		   -o -path '*/files/etc/uci-defaults/*' -o -path '*/files/etc/hotplug.d/*' \
 		   -o -path '*/files/lib/netifd/*' \) | sort); do
+	# Only POSIX-sh scripts belong here. A ucode worker (#!/usr/bin/ucode) is not shell, and
+	# `sh -n` would reject perfectly valid ucode; its syntax is exercised on-target instead
+	# (there is no ucode binary in host CI). Skip by shebang, not by extension.
+	case "$(head -n1 "$f")" in
+		*ucode*) continue ;;
+	esac
 	if sh -n "$f" 2>/dev/null; then ok "syntax $(basename "$f")"
 	else bad "syntax $(basename "$f")"; fi
 done
@@ -224,6 +230,74 @@ for mk in $(find "$PKGDIR" -maxdepth 2 -name Makefile -path '*luci-app-*' | sort
 		bad "$(basename "$(dirname "$mk")") has no rpcd reload in postinst"
 	fi
 done
+
+echo "== procd respawn, where used, takes three numeric args =="
+# procd_set_param respawn <threshold> <timeout> <retry>; a wrong arg count silently changes the
+# respawn behaviour and shows up only as a service that does not come back after a crash. NOT
+# every USE_PROCD service respawns - fm350-radio deliberately does not, because its trap has
+# already brought the link back and a re-apply could loop on hardware - so this validates the
+# FORM where respawn appears rather than mandating its presence.
+for f in $(find "$PKGDIR" -type f -path '*/etc/init.d/*' | sort); do
+	grep -q 'procd_set_param[[:space:]]\+respawn' "$f" || continue
+	if grep -qE 'procd_set_param[[:space:]]+respawn[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+([[:space:]]|$)' "$f"; then
+		ok "$(basename "$f") respawn has three numeric args"
+	else
+		bad "$(basename "$f") respawn is malformed (need three numeric args)"
+	fi
+done
+
+echo "== the SMS archiver must never use sms_tool 'delete all' =="
+# sms_tool's `delete all` is a hard-coded sweep of slots 0..49 - broken beyond 50 on a ~90-slot
+# store, and it would blow away messages the archiver has not copied yet. Bulk cleanup must
+# always go by explicit index list.
+if find "$PKGDIR" -type f -path '*h5000m-sms-archive*' \
+		-exec sh -c 'sed -e "s/[[:space:]]*#.*$//" "$1"' _ {} \; \
+		| grep -qE 'delete[[:space:]]+all'; then
+	bad "the SMS archiver contains 'delete all'"
+else
+	ok "no 'delete all' in the SMS archiver"
+fi
+
+echo "== the SMS archiver runs at its own AT priority tier =="
+# AT_PRIO=5: real work, so above the cosmetic status poll (1) but below every user action (20)
+# and the dialer (30). Literal-substring check, same style as the AT_PRIO=1 rpcd check.
+_arch=$PKGDIR/h5000m-sms-archive/files/usr/sbin/h5000m-sms-archive
+if [ -f "$_arch" ] && grep -q 'AT_PRIO=5' "$_arch"; then
+	ok "SMS archiver sets AT_PRIO=5"
+else
+	bad "SMS archiver does not set AT_PRIO=5"
+fi
+
+echo "== shared ucode libraries take no direct serial access =="
+# The grouping module is a pure library with no AT concept, but the same /dev/tty ban the rpcd
+# backends are held to applies: nothing outside the AT broker opens the port. Kept SEPARATE from
+# the rpcd AT_PRIO=1 check, which a pure library has no business setting.
+for f in $(find "$PKGDIR" -type f -path '*/share/ucode/*' | sort); do
+	if code_of "$f" | grep -qE '/dev/tty'; then
+		bad "$(basename "$f") references a tty directly"
+	else
+		ok "$(basename "$f") takes no direct serial access"
+	fi
+done
+
+echo "== keep.d entries must be absolute and not on tmpfs =="
+# /lib/upgrade/keep.d/* lists paths pulled into sysupgrade backups. A relative path, or one under
+# /tmp or /var (tmpfs, wiped every boot), silently defeats the backup with no symptom until the
+# next power cycle - exactly the failure the SMS archive's persistence is built to avoid.
+_keep=0
+_keepseen=0
+for f in $(find "$PKGDIR" -type f -path '*/lib/upgrade/keep.d/*' | sort); do
+	_keepseen=1
+	while IFS= read -r line; do
+		case "$line" in
+			''|'#'*) continue ;;
+			/tmp/*|/var/*) bad "keep.d $(basename "$f") lists a tmpfs path: $line"; _keep=1 ;;
+			/*) : ;;
+			*) bad "keep.d $(basename "$f") lists a non-absolute path: $line"; _keep=1 ;;
+		esac
+	done < "$f"
+done
+[ "$_keepseen" -eq 1 ] && [ "$_keep" -eq 0 ] && ok "keep.d entries are absolute and persistent"
 
 echo
 echo "checks=${checks} failures=${fails}"

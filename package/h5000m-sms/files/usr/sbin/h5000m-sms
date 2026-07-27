@@ -18,7 +18,9 @@
 #   options:  -d <tty> -b <baud> -f <datetime format> -j (JSON) -s <storage>
 #             -r/-R (raw) -D (debug)
 # `-j recv` is the form the LuCI backend uses; it emits JSON directly, so nothing here
-# has to parse PDUs. sms_tool already handles PDU mode, UCS2 and multipart reassembly.
+# has to parse PDUs. sms_tool handles PDU mode and UCS2, but it does NOT reassemble
+# concatenated ("multipart") SMS - it emits one JSON object per storage slot, and grouping
+# the segments into logical messages is the LuCI backend's job (luci.fm350: group_messages).
 
 set -u
 

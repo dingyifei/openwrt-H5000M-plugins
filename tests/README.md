@@ -16,7 +16,7 @@ violation and confirming the suite fails. That habit exists because this repo ha
 test that passed vacuously: it compared two empty files, because `uci show` with multiple
 arguments writes nothing.
 
-## `test-plugin-invariants.sh` — 31 static checks
+## `test-plugin-invariants.sh` — 47 static checks
 
 Every rule exists because the corresponding mistake was actually made, not as hypothetical
 hygiene:
@@ -35,7 +35,19 @@ hygiene:
   passes it, because that is a contract violation rather than a syntax error;
 - rpcd backends must take no direct serial access, must set `AT_PRIO=1`, must live in
   `/usr/share/rpcd/ucode` rather than the exec-plugin directory, and their Makefile must
-  reload rpcd in postinst.
+  reload rpcd in postinst;
+- a `procd_set_param respawn`, where present, must carry three numeric args — a wrong count
+  silently changes respawn behaviour and shows up only as a service that never comes back
+  (the check validates the form, it does not force respawn: fm350-radio deliberately omits it);
+- the SMS archiver must never call sms_tool `delete all` (a broken 0..49 sweep that would also
+  wipe not-yet-archived messages) and must run at its own `AT_PRIO=5` tier;
+- shared ucode libraries under `usr/share/ucode/` take no direct `/dev/tty` access, same ban as
+  the rpcd backends but a separate check (a pure library has no `AT_PRIO` to set);
+- every `/lib/upgrade/keep.d/*` entry is an absolute path and never under `/tmp` or `/var`
+  (tmpfs, wiped each boot) — the one property the SMS archive's persistence depends on.
+
+The shell-syntax check skips files whose shebang is `ucode`: they are not POSIX sh, and `sh -n`
+would reject valid ucode. Their syntax is exercised on-target instead.
 
 ## `test-log-library.sh` — 21 unit tests
 
@@ -73,7 +85,7 @@ that assertion — and only the expected ones — flips to FAIL (recreate the pl
 of the three delete guards; suppress the delete; suppress the log; skip the plumbing; break
 idempotency by making the `add_list` unconditional).
 
-## `test-sms-grouping.uc` — 21 unit tests (runs on the router)
+## `test-sms-grouping.uc` — 26 unit tests (needs a ucode interpreter)
 
 Concatenated-SMS reassembly, exercised against the shapes that actually occurred:
 
@@ -81,24 +93,32 @@ Concatenated-SMS reassembly, exercised against the shapes that actually occurred
   as parts 6,3,2,4,5,1 in slots 1–6. Sorting by slot yields `FCBDEA` instead of `ABCDEF`;
 - two messages from the same sender with the **same timestamp** and different concat
   references, which is why the grouping key is `(sender, reference, total)`. Keying on
-  timestamp instead — what `luci-app-sms-tool-js` does — fails 8 assertions here, splitting
-  the real message into four fragments *and* merging two unrelated ones into `AXBY`;
+  timestamp instead — what `luci-app-sms-tool-js` does — merges two unrelated messages;
 - an incomplete group, which must still render rather than disappear;
-- a standalone message, which carries no concat fields at all.
+- a standalone message, which carries no concat fields at all;
+- a segment that failed to decode, which is never dropped;
+- the `cmp_timestamp` comparator, which the live view (newest-first) and the archiver
+  (oldest-first) both sort through. The `MM/DD/YY` format is **not** lexically sortable —
+  "12/01/25" is chronologically before "07/27/26" but sorts after it as a string — so the
+  comparator parses the fields; the tests pin that, plus a null-timestamp fallback that must
+  not throw.
 
-It loads the **real** backend and swaps its export line, rather than duplicating the function —
-a copy would drift and then pass while the shipped code was broken.
+It targets the **shared module** (`h5000m-modem-atd/.../usr/share/ucode/h5000m/sms_grouping.uc`)
+the way the real consumers do — `loadfile()` then call — rather than duplicating the function,
+which would drift and then pass while the shipped code was broken. The backend and the archive
+worker both load this same file, so the one test covers all three.
 
 ```sh
-scp -r package tests root@192.168.10.1:/tmp/t/
-ssh root@192.168.10.1 'cd /tmp/t && ucode tests/test-sms-grouping.uc /tmp/t'
+scp -r package tests root@<router>:/tmp/t/
+ssh root@<router> 'cd /tmp/t && ucode tests/test-sms-grouping.uc /tmp/t'
 ```
 
-It is **not** in host CI, and that is deliberate rather than an oversight: the backend does
-`import ... from 'ubus'` so compiling it needs libubus, and there is no `ucode` package in
-Ubuntu 24.04 (checked — `packages.ubuntu.com/noble/ucode` is a 404). Making it "skip" on the
-host was rejected because a skipped test reads exactly like a passing one, which is the failure
-mode this repo has already been bitten by.
+It is **not** in host CI, and that is deliberate rather than an oversight: there is no `ucode`
+package in Ubuntu 24.04 (checked — `packages.ubuntu.com/noble/ucode` is a 404) or on macOS. Since
+the module is now a pure library with no `ubus`/`fs` imports it no longer needs libubus, so it
+runs anywhere a `ucode` binary exists — but making it "skip" when that binary is absent was
+rejected, because a skipped test reads exactly like a passing one, the failure mode this repo has
+already been bitten by.
 
 ## Still worth writing
 

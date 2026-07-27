@@ -42,6 +42,12 @@ define Package/h5000m-modem-atd/install
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/atio.sh $(1)/usr/lib/h5000m/atio.sh
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/modem-discover.sh \
 		$(1)/usr/lib/h5000m/modem-discover.sh
+	# Shared ucode library: concatenated-SMS grouping, used by the LuCI backend and the
+	# archive worker. Lives here (a hard dependency of both) so an absolute-path load never
+	# references a package that might not be installed.
+	$(INSTALL_DIR) $(1)/usr/share/ucode/h5000m
+	$(INSTALL_DATA) ./files/usr/share/ucode/h5000m/sms_grouping.uc \
+		$(1)/usr/share/ucode/h5000m/sms_grouping.uc
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/atq $(1)/usr/sbin/atq
 	$(INSTALL_BIN) ./files/usr/sbin/at-lease $(1)/usr/sbin/at-lease

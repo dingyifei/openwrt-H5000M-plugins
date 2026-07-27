@@ -32,8 +32,8 @@ define Package/h5000m-sms/description
   Ships h5000m-sms, a thin wrapper that runs sms_tool against the FM350-GL through
   at-lease. at-lease holds the same flock every AT consumer takes and exports MODEM_AT_B
   (the leased port), so no ttyUSB node is ever named - they renumber across
-  re-enumeration. sms_tool itself handles PDU mode, UCS2 and multipart reassembly, so
-  nothing here parses PDUs.
+  re-enumeration. sms_tool handles PDU mode and UCS2 but does NOT reassemble multipart
+  (concatenated) SMS; the LuCI backend groups the per-slot segments into whole messages.
 endef
 
 define Build/Compile

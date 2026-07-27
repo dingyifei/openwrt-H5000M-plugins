@@ -198,10 +198,13 @@ at_probe() {
 # competition with keeping the bearer alive.
 #
 # Consumers declare AT_PRIO. Higher wins:
-#   30  fm350-dialer      bearer health outranks everything
+#   30  fm350-dialer        bearer health outranks everything
 #   20  h5000m-sms, h5000m-esim   user-initiated, must complete
-#   10  atq (default)     interactive human
-#    1  LuCI status poll  cosmetic; must never delay the above
+#   10  atq (default)       interactive human
+#    5  h5000m-sms-archive  background FIFO archiver: real work (recv + delete), so above the
+#                           cosmetic poll, but below every user action - it must never contend
+#                           as an equal with a person sending an SMS or the dialer reconnecting
+#    1  LuCI status poll    cosmetic; must never delay the above
 #
 # ⚠️ This is APPROXIMATE priority, not a queue. flock has no ordering and cannot be given
 # one without a daemon that owns the port permanently. All a waiter can do is decline to

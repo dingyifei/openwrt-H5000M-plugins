@@ -1,0 +1,53 @@
+#!/bin/sh
+# Router-side SMS FIFO archiver - supervisor loop.
+#
+# procd runs this as a resident, respawning service. The heavy lifting is the ucode worker
+# (h5000m-sms-archive-worker); this loop only decides WHEN to run it and never dies on a bad
+# cycle, so there is no respawn storm (the process stays up) and no silent stall (every cycle
+# retries independently).
+#
+# UCI is re-read every cycle, so enabled/interval/threshold/batch_size/max_messages/storage_path
+# take effect on the NEXT cycle with no restart. Only the log LEVEL is read once at start (that
+# is log.sh's documented behaviour, shared with the dialer); changing h5000m.logging.sms_archive
+# needs `/etc/init.d/h5000m-sms-archive restart`.
+
+# shellcheck disable=SC1091
+. /usr/lib/h5000m/log.sh
+h5000m_log_init sms_archive
+
+WORKER=/usr/sbin/h5000m-sms-archive-worker
+_fails=0
+
+log_info "SMS archiver started"
+
+while :; do
+	ENABLED="$(uci -q get h5000m.sms_archive.enabled)"
+	INTERVAL="$(uci -q get h5000m.sms_archive.interval)"
+	case "$INTERVAL" in
+		''|*[!0-9]*) INTERVAL=900 ;;
+	esac
+	# Floor the interval: this contends for the single AT port, and a misconfigured tiny value
+	# must never turn the archiver into a busy-loop on the modem.
+	[ "$INTERVAL" -ge 60 ] || INTERVAL=60
+
+	if [ "$ENABLED" = 1 ]; then
+		# AT_PRIO=5: below every user action, above the cosmetic status poll. h5000m-sms keeps
+		# an already-set AT_PRIO, so recv/delete inside the worker inherit this tier.
+		export AT_PRIO=5
+		if _out="$("$WORKER" 2>&1)"; then
+			_fails=0
+			[ -n "$_out" ] && log_info "$_out"
+		else
+			_fails=$((_fails + 1))
+			log_warn "archive cycle failed: ${_out:-unknown error}"
+			# Escalate ONCE at a run of failures so a persistent fault is visible without
+			# flooding the log every interval.
+			[ "$_fails" = 5 ] && log_error "archive cycle has failed 5 times in a row; still retrying every ${INTERVAL}s"
+		fi
+	fi
+
+	# Backgrounded sleep + wait so a procd SIGTERM interrupts the wait promptly, the same idiom
+	# the dialer uses.
+	sleep "$INTERVAL" &
+	wait $! 2>/dev/null
+done

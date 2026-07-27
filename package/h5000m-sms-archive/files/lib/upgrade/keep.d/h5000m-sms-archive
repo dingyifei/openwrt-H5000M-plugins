@@ -1,0 +1,5 @@
+# Keep the SMS archive across a settings-preserving sysupgrade, and include it in
+# `sysupgrade -b` / LuCI "Generate archive" backups. Both read /lib/upgrade/keep.d/* directly.
+# Directory form so any future companion file under it is covered too. This is the whole reason
+# the archive lives in /etc and not /tmp or /var: those are tmpfs and wiped every boot.
+/etc/h5000m/

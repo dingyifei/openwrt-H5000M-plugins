@@ -23,7 +23,9 @@ define Package/luci-app-fm350
   # rpcd-mod-ucode is what loads the backend; without it the ubus object never appears and
   # every page shows "Access denied". h5000m-modem-atd supplies atq and the AT lock.
   DEPENDS:=+luci-base +rpcd-mod-ucode +h5000m-modem-atd
-  EXTRA_DEPENDS:=h5000m-sms (>=0)
+  # Both soft: the whole SMS area is optional. Present -> the inbox lists live messages and the
+  # archiver's saved ones; absent -> the SMS page simply shows whatever the modem still holds.
+  EXTRA_DEPENDS:=h5000m-sms (>=0), h5000m-sms-archive (>=0)
   PKGARCH:=all
 endef
 
