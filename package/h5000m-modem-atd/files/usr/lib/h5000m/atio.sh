@@ -15,7 +15,11 @@ H5000M_MODEM_STATE=/var/run/h5000m-modem.state
 
 # shellcheck disable=SC1091
 . /usr/lib/h5000m/log.sh
-h5000m_log_init modem_atd
+# Component `modem_atd` (the UCI key), tag `h5000m-modem` (what appears in syslog). The tag
+# is deliberately the one this layer has always used: changing it would silently break
+# every existing `logread -e h5000m-modem`, and a logging change that invalidates people's
+# log filters has made things worse, not better.
+h5000m_log_init modem_atd h5000m-modem
 
 # Kept as thin wrappers so every existing caller keeps working while the levels become
 # real. Note these take a plain string, not a format - callers pass pre-built messages.

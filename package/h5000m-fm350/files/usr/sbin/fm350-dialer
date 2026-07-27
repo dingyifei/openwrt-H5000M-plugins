@@ -235,15 +235,44 @@ while :; do
 done
 
 at 'AT+CMEE=2' 6 >/dev/null 2>&1
-case "$(at 'AT+CPIN?' 8)" in
-	*READY*) ;;
-	*)
-		warn "SIM not ready"
+
+# The SIM becomes READY strictly LATER than the AT port starts answering - the same race as
+# the modem-wait above, one layer in. On a cold boot the port replies while the card is
+# still initialising, and after inserting a SIM the modem additionally reruns carrier
+# config (a burst of +EDSBP/+EONSNWNAME URCs, observed here) before CPIN settles. Checking
+# once and giving up turns a perfectly good SIM into a blocked interface that only a manual
+# ifup clears.
+#
+# Bounded, because an ABSENT SIM is genuinely not self-correcting: there is no point
+# retrying forever, and blocking restart afterwards is right.
+SIM_WAIT=60
+_sim_end=$(( $(date +%s) + SIM_WAIT ))
+_sim_said=0
+while :; do
+	case "$(at 'AT+CPIN?' 8)" in
+		*READY*) break ;;
+		*SIM\ PIN*|*SIM\ PUK*)
+			# A locked SIM is a human problem; waiting cannot help and would only delay
+			# the message that says so.
+			warn "SIM is PIN/PUK locked - unlock it and run: ifup $INTERFACE"
+			proto_notify_error "$INTERFACE" SIM_LOCKED
+			proto_block_restart "$INTERFACE"
+			exit 1
+			;;
+	esac
+	if [ "$(date +%s)" -ge "$_sim_end" ]; then
+		warn "SIM not ready after ${SIM_WAIT}s - is a SIM inserted? then run: ifup $INTERFACE"
 		proto_notify_error "$INTERFACE" SIM_NOT_READY
 		proto_block_restart "$INTERFACE"
 		exit 1
-		;;
-esac
+	fi
+	if [ "$_sim_said" = 0 ]; then
+		log "waiting for the SIM to become ready"
+		_sim_said=1
+	fi
+	sleep 5
+done
+
 at 'AT+CGEREP=2,1' 6 >/dev/null 2>&1
 
 # Registration is a precondition, but there is no radio cycling here: nothing below
