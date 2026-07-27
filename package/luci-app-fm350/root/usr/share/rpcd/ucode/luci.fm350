@@ -365,6 +365,34 @@ function parse_gtact_caps(line) {
 	};
 }
 
+// +GTACT <rat> values, manual §11.1.14. A switch, not an object literal - ucode rejects bare
+// numeric keys. This is the modem's own enumeration, so it is decoded rather than shown raw;
+// the modulation codes in +GTCAINFO are deliberately NOT decoded, because no authoritative
+// code->QAM mapping exists for this modem and a wrong "256QAM" is worse than an integer.
+function gtact_rat_name(r) {
+	switch (r) {
+	case 1:  return 'UMTS';
+	case 2:  return 'LTE';
+	case 4:  return 'LTE/UMTS';
+	case 10: return 'automatic';
+	case 14: return 'NR';
+	case 16: return 'NR/UMTS';
+	case 17: return 'NR/LTE';
+	case 20: return 'NR/LTE/UMTS';
+	default: return `mode ${r}`;
+	}
+}
+
+// <PreferredAct1>/<PreferredAct2>: which RAT the modem should favour, same section.
+function gtact_pref_name(p) {
+	switch (p) {
+	case 2: return 'UMTS';
+	case 3: return 'LTE';
+	case 6: return 'NR';
+	default: return null;
+	}
+}
+
 // AT+GTACT? -> <rat>,<pref1>,<pref2>[,<band>...]
 function parse_gtact(line) {
 	if (!line)
@@ -375,7 +403,12 @@ function parse_gtact(line) {
 	const bands = [];
 	for (let i = 3; i < length(v); i++)
 		push(bands, v[i]);
-	return { rat: v[0], pref1: v[1] ?? null, pref2: v[2] ?? null, bands: bands };
+	return {
+		rat: v[0], rat_name: gtact_rat_name(v[0]),
+		pref1: v[1] ?? null, pref1_name: gtact_pref_name(v[1] ?? -1),
+		pref2: v[2] ?? null, pref2_name: gtact_pref_name(v[2] ?? -1),
+		bands: bands
+	};
 }
 
 // AT+GTDUALSIM? -> `+GTDUALSIM : 0, "SUB1", "L"`
