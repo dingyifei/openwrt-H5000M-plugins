@@ -253,12 +253,6 @@ return view.extend({
 		];
 	},
 
-	outageWarning: function() {
-		return [
-			E('p', {}, [ _('The modem re-registers on the new configuration. This takes up to about 2.5 minutes and CELLULAR GOES DOWN while it runs.') ]),
-			E('p', {}, [ _('If you are reading this over the cellular link, the page will lose contact and keep retrying on its own — do not close it.') ])
-		];
-	},
 
 	handleApply: function() {
 		var self = this;
@@ -266,7 +260,7 @@ return view.extend({
 		var bands = this.collectBands();
 		var persist = this.persistCb.checked ? 1 : 0;
 
-		var body = this.outageWarning();
+		var body = progress.outageWarning();
 		body.push(persist
 			? E('p', {}, [ E('strong', {}, [ _('“Keep after reboot” is ON — this lock will be written to config and survive a reboot.') ]) ])
 			: E('p', {}, [ _('This lock clears on the next reboot (your guaranteed way out).') ]));
@@ -289,7 +283,7 @@ return view.extend({
 
 	handleUnlock: function() {
 		var self = this;
-		var body = this.outageWarning();
+		var body = progress.outageWarning();
 		body.push(E('p', {}, [ _('This returns the modem to automatic band selection for every radio type.') ]));
 		// Measured: unlock is NOT "put it back how it was". AT+GTACT=10 enables every band the
 		// radio is capable of, which on this unit was WIDER than the set enabled from the
@@ -352,7 +346,7 @@ return view.extend({
 
 	confirmSim: function(slot) {
 		var self = this;
-		var body = this.outageWarning();
+		var body = progress.outageWarning();
 		if (slot === 1)
 			body.push(E('p', {}, [ E('strong', {}, [
 				_('The eSIM (eUICC) currently has NO profile installed. Cellular will stay DOWN after the switch until you provision one. This is expected — the guard treats an empty eUICC as success and will NOT revert it.')

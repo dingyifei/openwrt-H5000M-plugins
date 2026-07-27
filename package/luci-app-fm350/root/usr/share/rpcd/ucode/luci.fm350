@@ -589,6 +589,26 @@ function parse_cell_row(line) {
 	return row;
 }
 
+// Cell-lock ranges, from the modem's own AT+EMMCHLCK=?. ONE definition, because radio_info
+// ships these bounds to the UI for input validation and cell_set enforces them server-side -
+// two copies could drift into the UI advertising a range the backend rejects, or worse
+// accepting one it should not. Mirrored to /var/run like radio_caps so an rpcd restart (which
+// LuCI triggers on package install) does not re-pay an AT acquisition for a static value.
+function cell_caps() {
+	return cached('cell_caps', 86400, false, function() {
+		const disk = readfile('/var/run/fm350-emmchlck-caps') ?? '';
+		if (trim(disk) != '') {
+			const c = parse_emmchlck_caps(trim(disk));
+			if (c) return c;
+		}
+		const r = atq_batch([ 'AT+EMMCHLCK=?' ]);
+		const l = first_line(r, 'AT+EMMCHLCK=?', '+EMMCHLCK:');
+		if (l)
+			run(`printf '%s' ${shq(l)} > /var/run/fm350-emmchlck-caps 2>/dev/null`);
+		return parse_emmchlck_caps(l);
+	}).data;
+}
+
 // Write the guard's request file and start it via procd.
 //
 // Deliberately not `popen` + background: this window lasts minutes and must survive an rpcd
@@ -775,15 +795,10 @@ const methods = {
 			for (let r in (caps.data.rats ?? []))
 				push(rat_opts, { value: r, label: gtact_rat_name(r) });
 
-			// Cell-lock ranges: static per firmware, so its own long-lived slot.
-			const ccaps = cached('cell_caps', 86400, false, function() {
-				const r = atq_batch([ 'AT+EMMCHLCK=?' ]);
-				return parse_emmchlck_caps(first_line(r, 'AT+EMMCHLCK=?', '+EMMCHLCK:'));
-			});
 
 			return {
 				...cfg.data,
-				cell_caps: ccaps.data,
+				cell_caps: cell_caps(),
 				band_labels: label(cfg.data?.bands ?? []),
 				caps: {
 					rats: caps.data.rats,
@@ -898,10 +913,7 @@ const methods = {
 				return { ok: false, error: 'arfcn and pci are required' };
 			// Bounds come from the modem's own AT+EMMCHLCK=? rather than a hard-coded LTE
 			// range, so this tracks the firmware.
-			const c = cached('cell_caps', 86400, false, function() {
-				const r = atq_batch([ 'AT+EMMCHLCK=?' ]);
-				return parse_emmchlck_caps(first_line(r, 'AT+EMMCHLCK=?', '+EMMCHLCK:'));
-			}).data;
+			const c = cell_caps();
 			if (c?.arfcn && (a < c.arfcn.min || a > c.arfcn.max))
 				return { ok: false, error: `arfcn must be ${c.arfcn.min}-${c.arfcn.max}` };
 			if (c?.pci && (p < c.pci.min || p > c.pci.max))
