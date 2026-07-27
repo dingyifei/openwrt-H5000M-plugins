@@ -115,19 +115,19 @@ Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
 | Package | Provides |
 |---|---|
 | `h5000m-modem-atd` | FM350 AT broker: sysfs discovery, `atq`, `at-lease`, `modem-ports`, hotplug rules |
-| `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface + `fm350-radio` band/slot guard |
+| `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface + `fm350-radio` band/cell/slot guard |
 | `h5000m-lpac` | `h5000m-esim` — lpac over its AT backend, under the port lease |
 | `h5000m-sms` | `h5000m-sms` — `sms_tool` under the port lease; no PDU codec of our own |
 | `luci-proto-fm350` | LuCI handler so the `cellular` interface is editable in the web UI |
 | `luci-app-fm350` | Network → FM350: status, cells, SMS, band lock, and recovery actions |
 | `h5000m-ttl` | pins the cellular egress TTL/hop-limit via fw4; **off by default** |
-| `h5000m-travelmate-defaults` | one disabled STA VIF → `trm_wwan` |
+| `h5000m-travelmate-defaults` | the `trm_wwan` DHCP interface + wan-zone membership; reaps an SSID-less orphan STA |
 | `h5000m-tailscale-defaults` | `tailscale0` firewall zone, shipped logged out |
 | `h5000m-mwan3-policy` | wan → trm_wwan → cellular failover, public-IP tracking |
 
-Two host-side suites, both negative-controlled — injecting each violation makes them fail:
+Three host-side suites, all negative-controlled — injecting each violation makes them fail:
 
-`tests/test-plugin-invariants.sh` (31 checks) enforces rules learned the hard way on
+`tests/test-plugin-invariants.sh` (38 checks) enforces rules learned the hard way on
 hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -w`
 (busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
 credentials, no anonymous `wifi-iface` sections, LuCI protocol handlers must `return` the
@@ -138,6 +138,11 @@ live in `/usr/share/rpcd/ucode`, and reload rpcd in postinst.
 `logger` stubbed, so it needs no device. The redaction assertions grep for the actual
 IMSI/EID/ICCID/PDU rather than for the mask — a privacy control has to be proven, not
 eyeballed.
+
+`tests/test-travelmate-defaults.sh` (19 checks) runs the Travelmate uci-defaults against a
+stateful `uci` stub. Its load-bearing assertion is that a **real configured uplink survives
+untouched**: the previous version of that script matched any STA on `trm_wwan` and deleted its
+SSID and key, so a package upgrade would have disabled a working uplink.
 
 ### Build cost: why these packages use `EXTRA_DEPENDS`
 
@@ -169,6 +174,11 @@ closure into the actual rootfs with `--network none` and asserts it equals
 
 - ✅ Proven on hardware: AT discovery, `atq`/denylist, APN programming, proto registration,
   Travelmate/Tailscale uci-defaults (idempotent over three runs, `fw4 check` clean).
+- ✅ **Cell locking** via `AT+EMMCHLCK` (2026-07-28), LTE only — the RAT field accepts
+  `0,2,7`, so the NR form circulating online is rejected here. Verified: lock to the serving
+  cell (data at 91 ms), lock to a nonexistent PCI (65 s unregistered, **reverted itself**),
+  and unlock restoring both the lock *and* the RAT. ⚠️ **The command is absent from
+  `AT+CLAC`** — CLAC is a lower bound, not an inventory.
 - ✅ **Band locking, verified including the failure path** (2026-07-28). Locking LTE to B3
   applied and carried data; locking LTE-only to B14 — no coverage here — spent 45 s
   unregistered and then **reverted itself**, restoring the link without intervention.
@@ -224,6 +234,8 @@ fm350-usb-reset                          # recover a deaf AT port (detached, ~70
 # Band/slot changes NEVER go through atq - it refuses them - because they must be
 # verified and reverted if the link does not come back.
 printf 'ACTION=band\nRAT=20\nBANDS="103"\nPERSIST=0\n' > /var/run/fm350-radio.req
+# cell lock: an empty CELL_ARFCN clears it (and restores any RAT the lock narrowed)
+printf 'ACTION=cell\nCELL_ARFCN=1650\nCELL_PCI=187\nCELL_LTE_ONLY=1\nPERSIST=0\n' > /var/run/fm350-radio.req
 /etc/init.d/fm350-radio start            # apply, verify against DATA, revert on failure
 cat /var/run/fm350-radio.state           # applying|verifying|reverting|ok|failed|reverted
 at-lease lpac chip info                  # hand the port to a foreign tool

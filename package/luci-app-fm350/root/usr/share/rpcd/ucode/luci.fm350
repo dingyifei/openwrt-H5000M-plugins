@@ -411,6 +411,48 @@ function parse_gtact(line) {
 	};
 }
 
+// AT+EMMCHLCK? -> `+EMMCHLCK: 0` unlocked, or `+EMMCHLCK: 1,7,0,1650,187,0` locked.
+//
+// ⚠️ The READ form returns SIX fields where the SET form takes five, so a value read back
+// cannot be replayed verbatim - the guard trims it before restoring.
+//
+// This command is absent from AT+CLAC, which lists 37 commands and misses it: the third
+// instance of CLAC under-reporting on this firmware. CLAC finding a command proves presence;
+// CLAC missing one proves nothing at all.
+function parse_emmchlck(line) {
+	if (!line)
+		return { cell_locked: null };
+	const v = int_list(replace(line, /^\+EMMCHLCK:\s*/, ''));
+	if (!length(v) || v[0] == 0)
+		return { cell_locked: false };
+	return {
+		cell_locked: true,
+		cell_rat: v[1] ?? null,
+		cell_arfcn: v[3] ?? null,
+		cell_pci: v[4] ?? null
+	};
+}
+
+// AT+EMMCHLCK=? -> (0-1),(0,2,7),(0,1),(0-46589),(0-511)
+// The ARFCN and PCI ceilings drive the UI's input validation, so it tracks the firmware
+// rather than a hard-coded LTE range that a different build might not share.
+function parse_emmchlck_caps(line) {
+	if (!line)
+		return null;
+	const g = paren_groups(line);
+	if (length(g) < 5)
+		return null;
+	const rng = function(s) {
+		const m = match(s, /^(\d+)-(\d+)$/);
+		return m ? { min: +m[1], max: +m[2] } : null;
+	};
+	return {
+		rats: int_list(g[1]),
+		arfcn: rng(trim(g[3])),
+		pci: rng(trim(g[4]))
+	};
+}
+
 // AT+GTDUALSIM? -> `+GTDUALSIM : 0, "SUB1", "L"`
 // ⚠️ There is a SPACE before the colon and after each comma on this firmware. A regex
 // anchored on `+GTDUALSIM:` does not match. Measured, not guessed.
@@ -654,12 +696,13 @@ const methods = {
 	radio_info: {
 		call: function() {
 			const cfg = cached('radio_cfg', 30, true, function() {
-				const res = atq_batch([ 'AT+GTACT?', 'AT+GTDUALSIM?', 'AT+SIMTYPE?' ]);
+				const res = atq_batch([ 'AT+GTACT?', 'AT+GTDUALSIM?', 'AT+SIMTYPE?', 'AT+EMMCHLCK?' ]);
 				const st = first_line(res, 'AT+SIMTYPE?', '+SIMTYPE:');
 				const sm = st ? match(st, /\+SIMTYPE:\s*(\d+)/) : null;
 				return {
 					...(parse_gtact(first_line(res, 'AT+GTACT?', '+GTACT:')) ?? {}),
 					...parse_dualsim(first_line(res, 'AT+GTDUALSIM?', '+GTDUALSIM')),
+					...parse_emmchlck(first_line(res, 'AT+EMMCHLCK?', '+EMMCHLCK')),
 					sim_type: sm ? +sm[1] : null,
 					sim_type_name: sm ? (+sm[1] == 1 ? 'eSIM' : 'USIM') : null
 				};
@@ -697,8 +740,15 @@ const methods = {
 			for (let r in (caps.data.rats ?? []))
 				push(rat_opts, { value: r, label: gtact_rat_name(r) });
 
+			// Cell-lock ranges: static per firmware, so its own long-lived slot.
+			const ccaps = cached('cell_caps', 86400, false, function() {
+				const r = atq_batch([ 'AT+EMMCHLCK=?' ]);
+				return parse_emmchlck_caps(first_line(r, 'AT+EMMCHLCK=?', '+EMMCHLCK:'));
+			});
+
 			return {
 				...cfg.data,
+				cell_caps: ccaps.data,
 				band_labels: label(cfg.data?.bands ?? []),
 				caps: {
 					rats: caps.data.rats,
@@ -800,6 +850,38 @@ const methods = {
 			}
 			return start_guard(`ACTION=band\nRAT=${+rat}\nBANDS="${join(' ', bands)}"\n` +
 			                   `PERSIST=${req.args?.persist ? 1 : 0}\n`);
+		}
+	},
+
+	// Cell lock. The heavy lifting - CFUN cycle, reselection wait, revert - is the guard's;
+	// this only validates and hands off, for the same reason band_set does.
+	cell_set: {
+		args: { arfcn: 0, pci: 0, lte_only: 0, persist: 0 },
+		call: function(req) {
+			const a = req.args?.arfcn, p = req.args?.pci;
+			if (a == null || p == null)
+				return { ok: false, error: 'arfcn and pci are required' };
+			// Bounds come from the modem's own AT+EMMCHLCK=? rather than a hard-coded LTE
+			// range, so this tracks the firmware.
+			const c = cached('cell_caps', 86400, false, function() {
+				const r = atq_batch([ 'AT+EMMCHLCK=?' ]);
+				return parse_emmchlck_caps(first_line(r, 'AT+EMMCHLCK=?', '+EMMCHLCK:'));
+			}).data;
+			if (c?.arfcn && (a < c.arfcn.min || a > c.arfcn.max))
+				return { ok: false, error: `arfcn must be ${c.arfcn.min}-${c.arfcn.max}` };
+			if (c?.pci && (p < c.pci.min || p > c.pci.max))
+				return { ok: false, error: `pci must be ${c.pci.min}-${c.pci.max}` };
+			return start_guard(`ACTION=cell\nCELL_ARFCN=${+a}\nCELL_PCI=${+p}\n` +
+			                   `CELL_LTE_ONLY=${req.args?.lte_only ? 1 : 0}\n` +
+			                   `PERSIST=${req.args?.persist ? 1 : 0}\n`);
+		}
+	},
+
+	cell_unlock: {
+		call: function() {
+			// An empty ARFCN is the guard's unlock signal; it also puts back any RAT
+			// narrowing the lock applied.
+			return start_guard('ACTION=cell\nCELL_ARFCN=\nCELL_PCI=\nCELL_LTE_ONLY=0\nPERSIST=0\n');
 		}
 	},
 

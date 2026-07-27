@@ -24,7 +24,9 @@
 					"band_set",
 					"band_unlock",
 					"sim_set",
-					"sim_confirm"
+					"sim_confirm",
+					"cell_set",
+					"cell_unlock"
 				]
 			},
 			"uci": [
