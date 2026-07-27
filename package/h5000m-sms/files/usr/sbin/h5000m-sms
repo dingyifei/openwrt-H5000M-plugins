@@ -103,11 +103,27 @@ for _arg in "$@"; do
 done
 export H5000M_SMS_WANT_D H5000M_SMS_WANT_S
 
+# ⚠️ BOUNDED WITH timeout, because sms_tool CAN HANG FOREVER HOLDING THE PORT LEASE.
+# Measured: `sms_tool delete 99` (a slot with nothing in it) printed its banner and then hung
+# indefinitely - the process was still resident minutes later, `atq` reported "AT port busy",
+# and the dialer lost the bearer because it could not reach the modem at all. Deleting a
+# multipart message loops over every fragment index, so ONE already-empty slot wedged the whole
+# AT layer. That is how "delete does nothing" presented to the user.
+#
+# at_exec bounds its own exchanges, but sms_tool bypasses that entirely: it talks to the port
+# directly under the lease, so nothing else was capping it. The lease is only as safe as the
+# thing holding it.
+#
+# TERM first, then KILL 5s later, because a lease-holder that ignores TERM must still be made
+# to release the port - the whole point is that nothing may hold it indefinitely.
+: "${H5000M_SMS_TIMEOUT:=45}"
+export H5000M_SMS_TIMEOUT
+
 # Hand the leased AT port to sms_tool. at-lease exports MODEM_AT_B into our child; the
 # inner script prepends the options and execs. $0 is a label only - the user's arguments
 # arrive as "$@".
 exec at-lease sh -c '
 	[ -n "$H5000M_SMS_WANT_S" ] && set -- -s "$H5000M_SMS_WANT_S" "$@"
 	[ "$H5000M_SMS_WANT_D" = 1 ] && set -- -d "$MODEM_AT_B" "$@"
-	exec sms_tool "$@"
+	exec timeout -s TERM -k 5 "$H5000M_SMS_TIMEOUT" sms_tool "$@"
 ' sms_tool "$@"
