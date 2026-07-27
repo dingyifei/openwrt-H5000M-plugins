@@ -32,5 +32,12 @@
 		"order": 40,
 		"action": { "type": "view", "path": "fm350/radio" },
 		"depends": { "acl": [ "luci-app-fm350" ] }
+	},
+
+	"admin/network/fm350/ttl": {
+		"title": "TTL / Hop-limit",
+		"order": 50,
+		"action": { "type": "view", "path": "fm350/ttl" },
+		"depends": { "acl": [ "luci-app-fm350" ] }
 	}
 }

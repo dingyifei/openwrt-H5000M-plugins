@@ -112,6 +112,22 @@ return view.extend({
 		});
 	},
 
+	// A persistent banner shown while a delete is in flight and after it resolves. It lives in
+	// its own box (this.deleteBanner), NOT inside the inbox container that refresh() rebuilds,
+	// so it survives the follow-up sms_list re-read. `spinning` is the in-progress state; the
+	// final states (success/partial/unknown) replace it and stay put.
+	showBanner: function(msg, kind, spinning) {
+		var cls = 'alert-message' + (kind ? ' ' + kind : '');
+		var body = spinning
+			? [ E('span', { 'class': 'spinning' }, [ ' ' + msg ]) ]
+			: [ msg ];
+		dom.content(this.deleteBanner, E('div', { 'class': cls }, body));
+	},
+
+	clearBanner: function() {
+		dom.content(this.deleteBanner, '');
+	},
+
 	// `indexes` is the comma-separated list of every storage slot a LIVE message occupies.
 	// Deleting only the slot that was clicked would orphan the other segments, and a
 	// partially-deleted multipart message can never be reassembled. An ARCHIVED message has no
@@ -133,20 +149,60 @@ return view.extend({
 				E('button', {
 					'class': 'btn cbi-button-negative important',
 					'click': ui.createHandlerFn(this, function() {
+						// Close the modal and raise a PERSISTENT banner immediately - not a
+						// spinner that dies with the modal. A live delete serialises on the
+						// shared AT port and does one AT transaction per part, so it can take
+						// real seconds; the banner explains the wait instead of looking hung.
+						ui.hideModal();
+						var waitMsg = archived
+							? _('Removing the archived message…')
+							: (parts > 1)
+								? _('Deleting %d parts. The AT port is shared with the dialer keeping the uplink up, so each part can queue behind it — this may take a few seconds per part.').format(parts)
+								: _('Deleting the message. The AT port is shared with the dialer keeping the uplink up, so this can briefly queue behind it.');
+						self.showBanner(waitMsg, 'info', true);
+
 						var call = archived
 							? callDelete(null, null, 'archived', m.id)
 							: callDelete(null, indexes, 'live', null);
+
+						// The banner must survive until BOTH the RPC resolves AND the follow-up
+						// refresh lands, because the store count from sms_list is what actually
+						// proves the delete happened. So finalise inside refresh().then.
 						return call.then(function(res) {
-							ui.hideModal();
-							if (res && res.ok === false)
-								ui.addNotification(null, E('p', {}, [
-									archived
-										? _('The archived message could not be deleted: %s')
-											.format((res.error || '') + '')
-										: _('Some segments could not be deleted: %s')
-											.format((res.failed || []).join(', '))
-								]), 'danger');
-							return self.refresh();
+							return self.refresh().then(function() {
+								if (res && res.ok === false && res.failed) {
+									// The state the user most needs to know: leftover segments
+									// mean the message can never be reassembled again. This is
+									// exactly what a naive per-slot delete used to cause silently.
+									self.showBanner(
+										_('Some parts could not be deleted (slots %s). The message is now incomplete and cannot be reassembled.')
+											.format((res.failed || []).join(', ')),
+										'danger', false);
+								} else if (res && res.ok === false) {
+									self.showBanner(
+										_('The message could not be deleted: %s')
+											.format((res.error || '') + ''),
+										'danger', false);
+								} else {
+									var freed = (res && res.deleted) || parts;
+									self.showBanner(
+										_('Deleted — %d storage slot(s) freed.').format(freed),
+										'success', false);
+									// Success is transient news; clear it so it does not linger
+									// over an inbox that already reflects the deletion.
+									window.setTimeout(function() { self.clearBanner(); }, 5000);
+								}
+							});
+						}, function() {
+							// The RPC itself rejected - rpcd timeout, or the port wedged so the
+							// reply was lost. A delete whose reply never came back may well have
+							// SUCCEEDED, so do NOT report failure. Re-read and tell the truth:
+							// the outcome is unknown and the list has been refreshed.
+							return self.refresh().then(function() {
+								self.showBanner(
+									_('The delete request did not return a result — the AT port may be busy. The message list has been re-read; check whether the message is gone before trying again.'),
+									'warning', false);
+							});
 						});
 					})
 				}, [ _('Delete') ])
@@ -179,6 +235,10 @@ return view.extend({
 	render: function(d) {
 		this.container = E('div');
 		dom.content(this.container, this.renderContent(d));
+
+		// Delete-progress banner, kept OUTSIDE this.container so refresh() rebuilding the inbox
+		// does not wipe it mid-delete. Empty until a delete is started.
+		this.deleteBanner = E('div');
 
 		return E([], [
 			E('h2', {}, [ _('SMS') ]),
@@ -217,6 +277,7 @@ return view.extend({
 				}, [ _('Refresh') ])
 			]),
 
+			this.deleteBanner,
 			this.container
 		]);
 	},
