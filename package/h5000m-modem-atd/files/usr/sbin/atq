@@ -1,21 +1,42 @@
 #!/bin/sh
-# atq - run one AT command on the leased port (B). Never touches the dialer's port.
+# atq - run AT commands on the leased port.
 #
-#   atq 'AT+CSQ'            query signal
-#   atq -t 10 'AT+CGACT?'   with an explicit timeout
+#   atq 'AT+CSQ'                       query signal
+#   atq -t 10 'AT+CGACT?'              with an explicit timeout
+#   atq -b 'AT+CESQ' 'AT+COPS?' ...    BATCH: all commands under ONE lock acquisition
 #
-# Exit: 0 OK, 2 modem returned ERROR, 3 timeout, 4 refused, 1 no modem.
+# Exit: 0 OK, 2 modem returned ERROR, 3 timeout, 4 refused/busy, 1 no modem.
+#
+# Batch mode exists because the single AT port is the scarcest resource on this device. A
+# status page needs half a dozen queries; run one at a time they cost six lock
+# acquisitions, six chances to interleave with the dialer and six chances to be told the
+# port is busy. Batched they cost one. Output is machine-readable so a caller can tell
+# which reply belongs to which command and which of them failed:
+#
+#   @@CMD AT+CESQ
+#   +CESQ: 99,99,255,255,255,255,83,73,77
+#   @@RC 0
+#
+# Priority: AT_PRIO defaults to 10 (interactive human). The dialer declares 30 and SMS/eSIM
+# declare 20, so a casual query yields to both. Callers doing cosmetic polling should lower
+# it - the LuCI status page uses 1.
 set -u
 
 . /usr/lib/h5000m/atio.sh
 . /usr/lib/h5000m/modem-discover.sh
 
+: "${AT_PRIO:=10}"
+export AT_PRIO
+
 TIMEOUT=5
+BATCH=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-t) TIMEOUT="$2"; shift 2 ;;
+		-b) BATCH=1; shift ;;
 		-h|--help)
 			echo "usage: atq [-t seconds] 'AT+COMMAND'"
+			echo "       atq [-t seconds] -b 'AT+CMD1' 'AT+CMD2' ..."
 			exit 0
 			;;
 		--) shift; break ;;
@@ -24,34 +45,57 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-[ $# -ge 1 ] || { echo "usage: atq [-t seconds] 'AT+COMMAND'" >&2; exit 4; }
-CMD="$1"
+[ $# -ge 1 ] || { echo "usage: atq [-t seconds] [-b] 'AT+COMMAND' ..." >&2; exit 4; }
 
-# Commands that either block the port for minutes or belong exclusively to the
-# dialer's state machine. Refusing them here is what keeps a casual query from
-# wedging the modem for everyone - the vendor firmware's single semaphore had no
-# such guard and a stray AT+COPS=? would stall the whole stack.
-case "$(echo "$CMD" | tr 'a-z' 'A-Z' | tr -d ' ')" in
-	AT+COPS=?*)
-		echo "atq: refusing AT+COPS=? - a network scan blocks this port for minutes" >&2
-		exit 4
-		;;
-	AT+CFUN=*)
-		echo "atq: refusing AT+CFUN= - radio state belongs to the dialer" >&2
-		exit 4
-		;;
-	AT+CGDCONT=1,*)
-		echo "atq: refusing AT+CGDCONT=1, - PDP context 1 belongs to the dialer" >&2
-		exit 4
-		;;
-esac
+# Commands that either block the port for minutes or belong exclusively to the dialer's
+# state machine. Refusing them here is what keeps a casual query from wedging the modem for
+# everyone - the vendor firmware's single semaphore had no such guard and a stray
+# AT+COPS=? would stall the whole stack.
+atq_refuse() {
+	case "$(echo "$1" | tr 'a-z' 'A-Z' | tr -d ' ')" in
+		AT+COPS=?*)
+			echo "atq: refusing AT+COPS=? - a network scan blocks this port for minutes" >&2
+			return 0
+			;;
+		AT+CFUN=*)
+			echo "atq: refusing AT+CFUN= - radio state belongs to the dialer" >&2
+			return 0
+			;;
+		AT+CGDCONT=1,*)
+			echo "atq: refusing AT+CGDCONT=1, - PDP context 1 belongs to the dialer" >&2
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Screen EVERY command before taking the lock, so one bad entry in a batch cannot get the
+# port taken and then abort halfway through, leaving the modem mid-conversation.
+for _c in "$@"; do
+	atq_refuse "$_c" && exit 4
+done
 
 at_state_load || modem_discover_locked || { echo "atq: no modem" >&2; exit 1; }
 at_state_load || { echo "atq: no modem state" >&2; exit 1; }
 
 LOCK=$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_B_IF")
 
-at_locked "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$CMD" "$TIMEOUT"
+if [ "$BATCH" = 1 ]; then
+	mkdir -p "$H5000M_LOCKDIR"
+	(
+		at_flock_wait "${ATQ_WAIT:-10}" "$LOCK" || exit 4
+		for _c in "$@"; do
+			printf '@@CMD %s\n' "$_c"
+			at_exec "$MODEM_AT_B" "$_c" "$TIMEOUT"
+			printf '@@RC %s\n' "$?"
+		done
+	) 9>"$LOCK"
+	rc=$?
+	[ "$rc" = 4 ] && echo "atq: AT port busy" >&2
+	exit "$rc"
+fi
+
+at_locked "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$1" "$TIMEOUT"
 rc=$?
 [ "$rc" = 4 ] && echo "atq: AT port busy" >&2
 exit "$rc"

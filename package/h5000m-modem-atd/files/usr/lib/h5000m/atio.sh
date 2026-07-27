@@ -148,20 +148,83 @@ at_probe() {
 # NOTE: busybox flock supports only -s/-x/-u/-n. There is no -w, so a bounded wait has
 # to be built from -n plus a retry loop; using -w silently turned every acquisition into
 # a usage error that read as "AT port busy".
+# --- priority ---------------------------------------------------------------------
+# Every consumer contends for the SINGLE AT port, and until now they contended as equals:
+# whoever called flock at the right moment won. That is fine for a handful of CLI calls and
+# wrong the moment a web page starts polling, because it puts UI cosmetics in direct
+# competition with keeping the bearer alive.
+#
+# Consumers declare AT_PRIO. Higher wins:
+#   30  fm350-dialer      bearer health outranks everything
+#   20  h5000m-sms, h5000m-esim   user-initiated, must complete
+#   10  atq (default)     interactive human
+#    1  LuCI status poll  cosmetic; must never delay the above
+#
+# ⚠️ This is APPROXIMATE priority, not a queue. flock has no ordering and cannot be given
+# one without a daemon that owns the port permanently. All a waiter can do is decline to
+# race when it sees something more important also waiting. That is enough for the case that
+# matters - a 3s UI poll must not starve a dialer trying to restore the link - and it is
+# deliberately not described as a guarantee.
+: "${AT_PRIO:=10}"
+
+at_prio_file() { printf '%s.want' "$1"; }
+
+# Entries are "<pid> <prio>". A dead pid's entry is ignored and reaped on the next rewrite,
+# so a consumer killed mid-wait cannot block anyone forever.
+_at_prio_add() { printf '%s %s\n' "$$" "${AT_PRIO:-10}" >> "$1" 2>/dev/null; }
+
+_at_prio_del() {
+	[ -f "$1" ] || return 0
+	_pd_tmp="$1.$$"
+	while read -r _pd_pid _pd_val; do
+		[ "$_pd_pid" = "$$" ] && continue
+		[ -d "/proc/$_pd_pid" ] || continue
+		printf '%s %s\n' "$_pd_pid" "$_pd_val"
+	done < "$1" > "$_pd_tmp" 2>/dev/null
+	mv -f "$_pd_tmp" "$1" 2>/dev/null || rm -f "$_pd_tmp" 2>/dev/null
+	return 0
+}
+
+_at_prio_max_other() {
+	_pm_max=0
+	if [ -f "$1" ]; then
+		while read -r _pm_pid _pm_val; do
+			[ "$_pm_pid" = "$$" ] && continue
+			[ -d "/proc/$_pm_pid" ] || continue
+			case "$_pm_val" in ''|*[!0-9]*) continue ;; esac
+			[ "$_pm_val" -gt "$_pm_max" ] && _pm_max="$_pm_val"
+		done < "$1" 2>/dev/null
+	fi
+	printf '%s' "$_pm_max"
+}
+
+# at_flock_wait <wait_seconds> [lockfile]
+# The lockfile is optional only so an old caller keeps working; pass it to get priority.
 at_flock_wait() {
 	_fw_end=$(( $(date +%s) + ${1:-10} ))
-	until flock -n -x 9 2>/dev/null; do
-		[ "$(date +%s)" -lt "$_fw_end" ] || return 1
+	_fw_pf=''
+	[ -n "${2:-}" ] && { _fw_pf="$(at_prio_file "$2")"; _at_prio_add "$_fw_pf"; }
+
+	while :; do
+		if [ -n "$_fw_pf" ] && [ "$(_at_prio_max_other "$_fw_pf")" -gt "${AT_PRIO:-10}" ]; then
+			: # something more important is waiting - do not race it
+		elif flock -n -x 9 2>/dev/null; then
+			[ -n "$_fw_pf" ] && _at_prio_del "$_fw_pf"
+			return 0
+		fi
+		if [ "$(date +%s)" -ge "$_fw_end" ]; then
+			[ -n "$_fw_pf" ] && _at_prio_del "$_fw_pf"
+			return 1
+		fi
 		sleep 1
 	done
-	return 0
 }
 
 at_locked() {
 	_al_lock="$1"; _al_wait="$2"; shift 2
 	mkdir -p "$H5000M_LOCKDIR"
 	(
-		at_flock_wait "$_al_wait" || exit 4
+		at_flock_wait "$_al_wait" "$_al_lock" || exit 4
 		at_exec "$@"
 	) 9>"$_al_lock"
 }

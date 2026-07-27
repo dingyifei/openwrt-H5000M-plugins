@@ -22,6 +22,11 @@
 
 set -u
 
+# User-initiated and must complete: outranks status queries, yields to the dialer. Sending
+# an SMS that half-runs is worse than one that waits.
+: "${AT_PRIO:=20}"
+export AT_PRIO
+
 ATIO=/usr/lib/h5000m/atio.sh
 
 usage() {

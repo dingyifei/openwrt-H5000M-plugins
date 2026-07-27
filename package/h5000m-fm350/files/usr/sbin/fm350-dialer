@@ -20,6 +20,12 @@
 
 APN_TABLE=/usr/lib/h5000m/apn-table
 
+# Highest priority on the shared AT port: everything else is a query, this is the thing
+# keeping the uplink alive. Without this a UI poll can win the lock often enough to delay a
+# reconnect, which is the one delay a user actually notices.
+AT_PRIO=30
+export AT_PRIO
+
 INTERFACE=""; APN=""; PDP_TYPE="IPV4V6"; APN_TYPE="default"; METRIC=20; MTU=0; PEERDNS=1
 
 while [ $# -gt 0 ]; do

@@ -29,5 +29,5 @@ export MODEM_AT_A MODEM_AT_B MODEM_USBPATH MODEM_NETDEV
 at_port_setup "$MODEM_AT_B"
 
 exec 9>"$LOCK"
-at_flock_wait "$AT_LEASE_WAIT" || { echo "at-lease: AT port busy" >&2; exit 4; }
+at_flock_wait "$AT_LEASE_WAIT" "$LOCK" || { echo "at-lease: AT port busy" >&2; exit 4; }
 exec "$@"

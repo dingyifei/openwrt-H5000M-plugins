@@ -22,6 +22,11 @@
 
 set -u
 
+# User-initiated and must complete: an eSIM APDU conversation interrupted halfway can leave
+# the eUICC in a partial state, so this yields only to the dialer.
+: "${AT_PRIO:=20}"
+export AT_PRIO
+
 ATIO=/usr/lib/h5000m/atio.sh
 
 usage() {

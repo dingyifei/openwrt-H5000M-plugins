@@ -34,8 +34,14 @@ if [ -n "$target_radio" ]; then
 	done
 
 	# Create exactly one if none exists; otherwise normalize the one found.
+	# NAMED, not `uci add`. An anonymous section is exactly what LuCI's wireless-migration
+	# prompt ("无线配置迁移") exists to rename - it offers to rewrite it as wifinet# and
+	# RESTART THE NETWORK, which is a hostile thing to hand a user on first login. The
+	# lookup above matches on mode+network, so an already-migrated wifinet0 is adopted
+	# rather than duplicated; this only changes what fresh flashes create.
 	if [ -z "$sta_section" ]; then
-		sta_section="wireless.$(uci add wireless wifi-iface)"
+		sta_section='wireless.h5000m_sta'
+		uci -q set "${sta_section}=wifi-iface"
 	fi
 
 	# Attach to the preferred radio only when unset, so a Travelmate retarget survives re-runs.

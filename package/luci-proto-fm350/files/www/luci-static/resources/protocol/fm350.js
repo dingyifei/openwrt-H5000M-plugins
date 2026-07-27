@@ -10,7 +10,13 @@
 // script and dialer in h5000m-fm350 do that. This is purely the UI contract, and the
 // options below must stay in step with proto_config_add_* in /lib/netifd/proto/fm350.sh.
 
-network.registerProtocol('fm350', {
+// The `return` is load-bearing and its absence is silent: LuCI's require/compileClass uses
+// this module's RETURN VALUE as the protocol class, so without it the factory yields
+// undefined and the page dies with
+//   TypeError: "protocol.fm350" factory yields invalid constructor
+// `node --check` passes either way - this is a contract violation, not a syntax error -
+// which is why it shipped. Every official handler (protocol/dhcp.js et al) returns.
+return network.registerProtocol('fm350', {
 	getI18n: function() {
 		return _('FM350 Cellular (RNDIS)');
 	},

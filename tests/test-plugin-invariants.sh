@@ -87,6 +87,31 @@ for f in "$PKGDIR"/*/files/usr/sbin/*dialer; do
 	fi
 done
 
+echo "== LuCI protocol handlers must RETURN the registered class =="
+# Shipped broken: fm350.js called network.registerProtocol() without `return`, so LuCI's
+# require/compileClass got undefined and the interface page died with
+#   TypeError: "protocol.fm350" factory yields invalid constructor
+# `node --check` passes either way, because this is a contract violation and not a syntax
+# error - which is exactly why no existing check caught it.
+for f in $(find "$PKGDIR" -type f -path '*/resources/protocol/*.js' | sort); do
+	if grep -qE '^[[:space:]]*return[[:space:]]+network\.registerProtocol' "$f"; then
+		ok "$(basename "$f") returns its protocol class"
+	else
+		bad "$(basename "$f") calls registerProtocol without return"
+	fi
+done
+
+echo "== uci-defaults must not create anonymous wireless sections =="
+# `uci add wireless wifi-iface` yields an anonymous section, which is precisely what LuCI's
+# wireless-migration prompt exists to rewrite - and it restarts the network to do it. Name
+# the section instead so a fresh flash never greets the user with that dialog.
+if find "$PKGDIR" -type f -path '*/files/etc/uci-defaults/*' -exec sh -c 'sed -e "s/[[:space:]]*#.*$//" "$1"' _ {} \; \
+		| grep -qE 'uci[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*add[[:space:]]+wireless'; then
+	bad "uci add wireless creates an anonymous section"
+else
+	ok "no anonymous wireless sections created"
+fi
+
 echo
 echo "checks=${checks} failures=${fails}"
 [ "$fails" -eq 0 ] || exit 1
