@@ -72,11 +72,14 @@ at_one() {
 
 # L0 - the authority. Free, no AT: the interface is only genuinely usable when netifd says it
 # is up AND it has an address.
+# ONE ubus call, matched with case. wait_data() polls this every 5s for up to T_DATA=90 and
+# runs on every apply and again after every revert, so calling ubus twice and grepping each
+# cost ~108 forks and 36 round trips per verify pass where 18 do. `case` is a shell builtin -
+# the whole check is now 2 forks.
 data_ok() {
-	ubus call "network.interface.${IFACE}" status 2>/dev/null \
-		| grep -q '"up": true' || return 1
-	ubus call "network.interface.${IFACE}" status 2>/dev/null \
-		| grep -q '"address"' || return 1
+	_dk=$(ubus call "network.interface.${IFACE}" status 2>/dev/null)
+	case "$_dk" in *'"up": true'*) ;; *) return 1 ;; esac
+	case "$_dk" in *'"address"'*)  ;; *) return 1 ;; esac
 	return 0
 }
 

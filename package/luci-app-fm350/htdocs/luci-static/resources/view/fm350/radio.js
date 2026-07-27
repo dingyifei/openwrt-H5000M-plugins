@@ -3,7 +3,7 @@
 'require rpc';
 'require dom';
 'require ui';
-'require fm350.progress';
+'require fm350.progress as progress';
 
 // FM350 radio configuration: band lock, cell lock, SIM slot, APN.
 //

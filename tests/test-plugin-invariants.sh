@@ -124,6 +124,23 @@ for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); 
 done
 [ "$_mod" -eq 0 ] && ok "all LuCI resource modules return a class"
 
+echo "== a dotted LuCI require must name its alias explicitly =="
+# LuCI derives an un-aliased require's variable name as
+#   dep.replace(/[^a-zA-Z0-9_]/g, '_')
+# (luci.js, the `as = m[2] || ...` line), so `'require fm350.progress'` binds the local
+# variable `fm350_progress` - NOT `progress`. Shipped exactly that way: the module loaded fine
+# and every page then died at first use with "ReferenceError: progress is not defined".
+# `node --check` cannot see it, because the reference is only invalid at runtime.
+# An explicit `as` makes the binding say what it is instead of relying on that substitution.
+_alias=0
+for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); do
+	if grep -qE "^'require[[:space:]]+[A-Za-z0-9_]+\.[A-Za-z0-9_.]+'[[:space:]]*;" "$f"; then
+		bad "$(basename "$f") has a dotted require with no 'as' alias"
+		_alias=1
+	fi
+done
+[ "$_alias" -eq 0 ] && ok "dotted requires all name their alias"
+
 echo "== uci-defaults must not create anonymous wireless sections =="
 # `uci add wireless wifi-iface` yields an anonymous section, which is precisely what LuCI's
 # wireless-migration prompt exists to rewrite - and it restarts the network to do it. Name

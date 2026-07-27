@@ -17,7 +17,7 @@
 
 'use strict';
 
-import { popen, readfile, stat } from 'fs';
+import { popen, readfile, stat, writefile, rename } from 'fs';
 import { connect } from 'ubus';
 
 const IFACE = 'cellular';
@@ -29,6 +29,16 @@ const GUARD_STATE = '/var/run/fm350-radio.state';
 // Produced by the detached cell collector. AT+GTCCINFO? is documented <3s and rpcd is
 // SINGLE-THREADED, so calling it inline would freeze every LuCI page for the duration.
 const CELLS_FILE = '/var/run/fm350-cells.json';
+// Persistent, overlay-backed SMS archive written by h5000m-sms-archive. Read here to merge
+// archived messages into the inbox; missing/unparseable is treated as "no archive" and never
+// surfaced as an error, matching how a missing modem binary already degrades on this backend.
+const SMS_ARCHIVE = '/etc/h5000m/sms-archive.json';
+
+// Concatenated-SMS grouping lives in h5000m-modem-atd (a HARD dependency of this app) so both
+// this backend and the archive worker share one implementation. loadfile() runs the module and
+// returns its exports; a missing file would throw, which is acceptable and by design - the
+// module is in a hard-dep package precisely so it is always present. See the module header.
+const grouping = loadfile('/usr/share/ucode/h5000m/sms_grouping.uc')();
 
 // Cached across calls because rpcd keeps the VM loaded: N browser tabs then cost ONE AT
 // transaction per interval instead of N. Without this, two open tabs in live mode would
@@ -511,6 +521,8 @@ function parse_cell_row(line) {
 	const rat = +trim(f[1]);
 	if (rat != 2 && rat != 4 && rat != 9)
 		return null;
+	// Drives both the field layout of a neighbour row and the dBm conversion below.
+	const nr = (rat == 9);
 
 	const num = function(x) {
 		const t = trim(x ?? '');
@@ -529,7 +541,7 @@ function parse_cell_row(line) {
 		pci: num(f[7])
 	};
 
-	// Field 9 onwards diverges between the two shapes.
+	// Field 8 onwards diverges between the two shapes.
 	let rsrp, rsrq;
 	if (serving) {
 		const b = num(f[8]);
@@ -540,11 +552,40 @@ function parse_cell_row(line) {
 		rsrp = num(f[12]);
 		rsrq = num(f[13]);
 	} else {
+		// Position 8 is <bandwidth> on an LTE neighbour but <ss_sinr> on an NR one; 9-11
+		// (rxlev, rsrp, rsrq) line up for both.
+		if (nr) row.snr = num(f[8]);
+		else    row.bandwidth = num(f[8]);
 		rsrp = num(f[10]);
 		rsrq = num(f[11]);
 	}
-	row.rsrp = (rsrp != null) ? rsrp - 140 : null;
-	row.rsrq = (rsrq != null) ? (rsrq / 2) - 19.5 : null;
+
+	// ⚠️ THE SCALES ARE RAT-DEPENDENT, exactly like +CESQ - and this code got it wrong first
+	// time by applying the LTE formula to NR rows. Manual §11.1.15 defines two ladders:
+	//   LTE  0 -> RSRP < -140 dBm,  96 -> -45..-44      =>  RSRP    = value - 140
+	//   NR   0 -> SS-RSRP < -156,  126 -> >= -31        =>  SS-RSRP = value - 156
+	// Caught on a hand-locked NR cell: raw ss_rsrq 77 rendered as +19.5 dB through the LTE
+	// formula. RSRQ is never positive, which is what made it obvious - the RSRP error
+	// (-94 instead of -110) looked perfectly plausible and would have gone unnoticed.
+	// 255 means "not known or not detectable" and must read as absent, not as a number.
+	const rsrp_floor = nr ? 156 : 140;
+	const rsrq_off   = nr ? 43  : 19.5;
+	row.rsrp = (rsrp != null && rsrp != 255) ? rsrp - rsrp_floor : null;
+	row.rsrq = (rsrq != null && rsrq != 255) ? (rsrq / 2) - rsrq_off : null;
+
+	// ⚠️ SANITY-CLAMP, because this modem reports NR neighbour values OUTSIDE the documented
+	// 0-255 ladder. Measured in one snapshot, same command, same second:
+	//     ...,633984,422,,336,336,55   -> 336 - 156 = +180 dBm   impossible
+	//     ...,174750,521,,51,51,60     ->  51 - 156 = -105 dBm   plausible
+	// The manual gives no scale that makes 336 meaningful, so any number derived from it is
+	// invented. A dash is honest; "+180 dBm" is not, and a plausible-looking wrong figure is
+	// worse than an absent one - the same reason QCI and the modulation codes are not decoded.
+	// Physical bounds: SS-RSRP/RSRP bottom out around -156/-140 and never exceed about -30;
+	// RSRQ is a ratio and is never positive.
+	if (row.rsrp != null && (row.rsrp > -30 || row.rsrp < -160))
+		row.rsrp = null;
+	if (row.rsrq != null && (row.rsrq > 0 || row.rsrq < -45))
+		row.rsrq = null;
 	return row;
 }
 
@@ -572,88 +613,82 @@ function start_guard(body) {
 	return { ok: true, note: 'applying; the link drops briefly and reverts itself if it fails' };
 }
 
-// Reassemble concatenated ("multipart") SMS.
-//
-// A GSM SMS carries 140 bytes. Chinese cannot be expressed in GSM 7-bit, so it goes out as
-// UCS-2 at 2 bytes/char = 70 characters, and anything longer is SPLIT BY THE SENDER into
-// segments carrying a User Data Header with a reference id, a part count and a sequence
-// number. Reassembly is the receiver's job. sms_tool parses that UDH and exposes
-// `reference`/`part`/`total` in -j output, but it never joins the segments - so one message
-// showed up in the inbox as six rows, and Delete removed one of them, orphaning the rest.
-//
-// Group on (sender, reference, total). Deliberately NOT on timestamp: the SMSC stamps each
-// segment separately and they routinely differ by a second or more. luci-app-sms-tool-js
-// keys on sender-timestamp-total and drops `reference` entirely, which is exactly the
-// fragile version of this.
-//
-// ⚠️ `reference` is only the LOW BYTE when the carrier uses a 16-bit concat reference (UDH
-// IEI 0x08): sms_tool reads the last three UDH octets with no IEI dispatch and discards the
-// MSB. That is fine as a grouping key within a single `recv` snapshot - which is all this is
-// - but it must never be treated as globally unique or persisted as an id.
-function group_messages(msgs) {
-	const order = [];
-	const groups = {};
+// Concatenated-SMS grouping was moved verbatim into the shared module loaded above, so the
+// archive worker and this backend cannot drift apart. `group_messages(msgs)` groups segments
+// on (sender, reference, total), sorts by part and joins content; the full rationale lives in
+// the module. Kept as a one-line alias so the callers below (and the unit test's expectations)
+// read the same as before.
+function group_messages(msgs) { return grouping.group_messages(msgs); }
 
-	for (let m in msgs) {
-		// sms_tool emits reference/part/total ONLY when the PDU carried a concat UDH, so a
-		// missing `total` means genuinely standalone, not "unknown".
-		if (!m.total || m.total < 2) {
-			push(order, { single: m });
-			continue;
-		}
-		const key = `${m.sender ?? ''}|${m.reference ?? 0}|${m.total}`;
-		let g = groups[key];
-		if (!g) {
-			g = { segs: [], total: m.total, sender: m.sender, reference: m.reference };
-			groups[key] = g;
-			push(order, { group: g });   // preserve first-seen order for the inbox
-		}
-		push(g.segs, m);
-	}
+// A distinct, lower-confidence failure than the multipart bug: sms_tool does not escape the
+// `sender` field in its JSON, so an alphanumeric sender ID could in principle produce output
+// that json() rejects. Silently returning an empty inbox would then read as "no messages" -
+// indistinguishable from a genuinely empty store - so say so in syslog. logger, not a ucode
+// log module, because this backend has no other logging dependency and one line is enough.
+function warn_log(msg) {
+	run(`logger -t fm350-ui -p daemon.warning ${shq(msg)} 2>/dev/null`);
+}
 
+// Read the persistent archive. Missing or unparseable -> empty, no error surfaced: the same
+// graceful-degradation posture the rest of this backend uses for absent runtime state. Returns
+// the archived messages already shaped like grouped live messages so the view renders both
+// uniformly - `origin: 'archived'` and a stable `id` are what the delete path keys on.
+function read_archive() {
+	const raw = readfile(SMS_ARCHIVE);
+	if (raw == null || raw == '')
+		return [];
+	let doc = null;
+	try { doc = json(raw); } catch (e) { doc = null; }
+	const list = doc?.messages ?? [];
 	const out = [];
-	for (let entry in order) {
-		if (entry.single) {
-			const s = entry.single;
-			push(out, {
-				index: s.index, indexes: [ s.index ],
-				sender: s.sender, timestamp: s.timestamp,
-				content: s.content, error: s.error,
-				parts: 1, total: 1, complete: true
-			});
-			continue;
-		}
-
-		const g = entry.group;
-		// Sort by part. Storage index order is NOT part order - measured on this unit, a
-		// six-part message arrived as parts 6,3,2,4,5,1 in slots 1..6. Relying on emission
-		// order would silently scramble the text.
-		sort(g.segs, function(a, b) { return (a.part ?? 0) - (b.part ?? 0); });
-
-		let text = '';
-		let bad = false;
-		const idx = [];
-		for (let s in g.segs) {
-			if (s.error != null) bad = true;
-			text += (s.content ?? '');
-			push(idx, s.index);
-		}
-
-		const have = length(g.segs);
+	for (let a in list) {
 		push(out, {
-			// `index` stays the first segment's slot so older callers still work; `indexes`
-			// is what Delete must use, or the remaining segments are orphaned forever.
-			index: idx[0], indexes: idx,
-			sender: g.sender,
-			timestamp: g.segs[0]?.timestamp,
-			content: text,
-			reference: g.reference,
-			parts: have, total: g.total,
-			complete: (have == g.total) && !bad,
-			error: bad ? 'one or more segments failed to decode' : null
+			origin: 'archived',
+			id: a.id,
+			// Archived rows carry no live storage slots (they were deleted from the modem);
+			// the delete path uses `id`, and `indexes: []` keeps the view's shared code happy.
+			index: null, indexes: [],
+			sender: a.sender, timestamp: a.timestamp,
+			content: a.content, error: a.error ?? null,
+			parts: a.parts ?? a.total ?? 1, total: a.total ?? 1,
+			complete: a.complete ?? true
 		});
 	}
 	return out;
+}
+
+// Remove one archived message by id and rewrite the file atomically (temp + rename, so a
+// concurrent read never sees a half-written file). Preserves `next_id` and every other entry.
+// This can race the archive worker, which also rewrites the file; both use atomic rename so the
+// loser of a race is overwritten cleanly, never corrupted - acceptable for a personal router
+// where the two rarely touch it at the same instant.
+function delete_archived(id) {
+	if (id == null || id == '')
+		return { ok: false, error: 'id is required for an archived delete' };
+	const raw = readfile(SMS_ARCHIVE);
+	if (raw == null || raw == '')
+		return { ok: false, error: 'no archive file' };
+	let doc = null;
+	try { doc = json(raw); } catch (e) { doc = null; }
+	if (doc == null)
+		return { ok: false, error: 'archive file is unreadable' };
+
+	const kept = [];
+	let removed = false;
+	for (let a in (doc.messages ?? [])) {
+		if (a.id == id) removed = true;
+		else push(kept, a);
+	}
+	if (!removed)
+		return { ok: false, error: 'no archived message with that id' };
+
+	doc.messages = kept;
+	const tmp = SMS_ARCHIVE + '.tmp';
+	if (writefile(tmp, sprintf('%J', doc)) == null)
+		return { ok: false, error: 'could not write the archive' };
+	if (!rename(tmp, SMS_ARCHIVE))
+		return { ok: false, error: 'could not replace the archive' };
+	return { ok: true, deleted: 1 };
 }
 
 const methods = {
@@ -916,7 +951,30 @@ const methods = {
 			// it parses the UDH and hands us one object per SEGMENT. Grouping is ours.
 			const out = run('/usr/sbin/h5000m-sms -j recv 2>/dev/null');
 			let msgs = [];
-			try { msgs = json(out)?.msg ?? []; } catch (e) { msgs = []; }
+			try {
+				msgs = json(out)?.msg ?? [];
+			} catch (e) {
+				// Do NOT swallow this into an empty inbox: that is indistinguishable from a
+				// genuinely empty store and hid a real parse failure. Warn, then continue with
+				// no live messages so the archived ones still render.
+				warn_log(`sms_list: could not parse recv JSON (${e}) - showing archived only`);
+				msgs = [];
+			}
+
+			// Tag each grouped live message so the view and the delete path can tell it from
+			// an archived one - a live delete talks to the modem, an archived delete rewrites
+			// the archive file.
+			const live = group_messages(msgs);
+			for (let g in live) g.origin = 'live';
+
+			// Merge in the persistent archive. Concatenate, then sort newest-first through the
+			// SAME comparator the archiver sorts oldest-first with, so archived and live rows
+			// interleave by time instead of appearing as two separate blocks. Note this makes
+			// the inbox time-ordered rather than storage-ordered - newest-first, the natural
+			// inbox order - even when the archive is empty.
+			const archived = read_archive();
+			const all = [ ...live, ...archived ];
+			sort(all, function(a, b) { return grouping.cmp_timestamp(b.timestamp, a.timestamp); });
 
 			// Storage counters, so a filling store is visible BEFORE it starts silently
 			// rejecting messages. There is no read/unread flag anywhere in this data.
@@ -924,11 +982,14 @@ const methods = {
 			// `used` counts SEGMENTS, because that is what occupies slots - one 6-part
 			// Chinese message really does consume 6 of 90. Reporting the grouped count here
 			// would understate how full the store is, which is the opposite of useful.
+			// used/total stay MODEM-ONLY: they are the number actually at risk of overflowing;
+			// archived messages are off the modem and cannot fill it.
 			const stat = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
 			const m = match(stat, /used:\s*(\d+),\s*total:\s*(\d+)/);
 			return {
-				messages: group_messages(msgs),
+				messages: all,
 				segments: length(msgs),
+				archived_count: length(archived),
 				used: m ? +m[1] : null,
 				total: m ? +m[2] : null
 			};
@@ -958,8 +1019,14 @@ const methods = {
 		// storage slot PER SEGMENT: deleting only the slot the user clicked would leave the
 		// other five behind, and a partially-deleted message can never be reassembled.
 		// `index` is kept for a single-segment delete and as the older calling convention.
-		args: { index: 0, indexes: 'string' },
+		// `origin`/`id` route an ARCHIVED delete: origin='archived' + id removes the entry
+		// from the archive file with no AT interaction. origin absent or 'live' = the modem
+		// path below.
+		args: { index: 0, indexes: 'string', origin: 'string', id: 'string' },
 		call: function(req) {
+			if (req.args?.origin == 'archived')
+				return delete_archived(req.args?.id);
+
 			let list = [];
 			const raw = req.args?.indexes;
 			if (raw != null && raw != '') {

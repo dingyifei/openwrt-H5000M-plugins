@@ -6,15 +6,17 @@
 
 // FM350 SMS inbox and composer.
 //
-// sms_tool (from the official feed) already decodes PDU mode, UCS2 and multipart
-// reassembly, so nothing here parses a PDU. The backend runs it under the AT-port lease so
-// reading the inbox cannot desynchronise the dialer.
+// sms_tool (from the official feed) decodes PDU mode and UCS2, but it does NOT reassemble
+// multipart (concatenated) SMS - it emits one row per storage slot. The rpcd backend groups
+// the segments into logical messages and merges in any router-side archive, so each row here
+// is already one whole message. The backend runs sms_tool under the AT-port lease so reading
+// the inbox cannot desynchronise the dialer.
 
 var callList   = rpc.declare({ object: 'luci.fm350', method: 'sms_list', expect: { '': {} } });
 var callSend   = rpc.declare({ object: 'luci.fm350', method: 'sms_send',
                                params: [ 'number', 'text' ], expect: { '': {} } });
 var callDelete = rpc.declare({ object: 'luci.fm350', method: 'sms_delete',
-                               params: [ 'index', 'indexes' ], expect: { '': {} } });
+                               params: [ 'index', 'indexes', 'origin', 'id' ], expect: { '': {} } });
 
 return view.extend({
 	load: function() {
@@ -54,14 +56,21 @@ return view.extend({
 
 			var idxList = (m.indexes && m.indexes.length) ? m.indexes.join(',') : String(m.index);
 
+			// An archived message lives in the router's saved file, not the modem store; mark
+			// it so the reader knows why it survives a full store, and so the delete path knows
+			// to rewrite the archive instead of issuing an AT+CMGD.
+			var when = [ m.timestamp || E('em', {}, [ '—' ]) ];
+			if (m.origin === 'archived')
+				when.push(E('span', { 'class': 'cbi-value-description' }, [ ' ' + _('(archived)') ]));
+
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td left', 'width': '18%' }, [ m.sender || E('em', {}, [ '—' ]) ]),
-				E('td', { 'class': 'td left', 'width': '22%' }, [ m.timestamp || E('em', {}, [ '—' ]) ]),
+				E('td', { 'class': 'td left', 'width': '22%' }, when),
 				E('td', { 'class': 'td left' }, [ body, parts || '' ]),
 				E('td', { 'class': 'td right', 'width': '8%' }, [
 					E('button', {
 						'class': 'btn cbi-button-remove',
-						'click': ui.createHandlerFn(self, 'handleDelete', idxList, m.total || 1)
+						'click': ui.createHandlerFn(self, 'handleDelete', m, idxList)
 					}, [ _('Delete') ])
 				])
 			]);
@@ -103,14 +112,19 @@ return view.extend({
 		});
 	},
 
-	// `indexes` is the comma-separated list of every storage slot this message occupies.
+	// `indexes` is the comma-separated list of every storage slot a LIVE message occupies.
 	// Deleting only the slot that was clicked would orphan the other segments, and a
-	// partially-deleted multipart message can never be reassembled.
-	handleDelete: function(indexes, parts, ev) {
+	// partially-deleted multipart message can never be reassembled. An ARCHIVED message has no
+	// modem slots - it is deleted from the router's saved file by id, with no AT interaction.
+	handleDelete: function(m, indexes, ev) {
 		var self = this;
-		var note = (parts > 1)
-			? _('This message spans %d storage slots; all of them are removed.').format(parts)
-			: _('It is removed from the modem store and cannot be recovered.');
+		var archived = (m.origin === 'archived');
+		var parts = m.total || 1;
+		var note = archived
+			? _('It is removed from the router\'s saved archive and cannot be recovered.')
+			: (parts > 1)
+				? _('This message spans %d storage slots; all of them are removed.').format(parts)
+				: _('It is removed from the modem store and cannot be recovered.');
 
 		return ui.showModal(_('Delete this message?'), [
 			E('p', {}, [ note ]),
@@ -119,12 +133,18 @@ return view.extend({
 				E('button', {
 					'class': 'btn cbi-button-negative important',
 					'click': ui.createHandlerFn(this, function() {
-						return callDelete(null, indexes).then(function(res) {
+						var call = archived
+							? callDelete(null, null, 'archived', m.id)
+							: callDelete(null, indexes, 'live', null);
+						return call.then(function(res) {
 							ui.hideModal();
 							if (res && res.ok === false)
 								ui.addNotification(null, E('p', {}, [
-									_('Some segments could not be deleted: %s')
-										.format((res.failed || []).join(', '))
+									archived
+										? _('The archived message could not be deleted: %s')
+											.format((res.error || '') + '')
+										: _('Some segments could not be deleted: %s')
+											.format((res.failed || []).join(', '))
 								]), 'danger');
 							return self.refresh();
 						});

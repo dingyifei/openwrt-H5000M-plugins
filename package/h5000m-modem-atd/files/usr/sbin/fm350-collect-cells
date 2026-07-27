@@ -71,9 +71,12 @@ collect() {
 		#
 		# Values are digits, commas and hex only, so the character class below is a whitelist
 		# rather than an escape: nothing that reaches the JSON can carry a quote or backslash.
+		# The whitelist runs ONCE over the whole blob rather than per line: a
+		# `$(printf | tr)` inside the loop is 3 forks per row, and the modem reports up to
+		# ten neighbours per RAT, so a collection cost 30-90 forks for a pure character
+		# filter. Filtering the stream up front makes the loop body fork-free.
 		_first=1
-		printf '%s\n' "$_raw" | while IFS= read -r _l; do
-			_c=$(printf '%s' "$_l" | tr -dc '0-9A-Fa-f,')
+		printf '%s\n' "$_raw" | tr -dc '0-9A-Fa-f,\n' | while IFS= read -r _c; do
 			case "$_c" in
 				1,*|2,*) ;;
 				*) continue ;;

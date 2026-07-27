@@ -3,7 +3,7 @@
 'require rpc';
 'require dom';
 'require ui';
-'require fm350.progress';
+'require fm350.progress as progress';
 
 // FM350 cell survey page.
 //
