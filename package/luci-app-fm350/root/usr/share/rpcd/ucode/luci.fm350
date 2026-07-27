@@ -17,16 +17,57 @@
 
 'use strict';
 
-import { popen, readfile } from 'fs';
+import { popen, readfile, stat } from 'fs';
 import { connect } from 'ubus';
 
 const IFACE = 'cellular';
 const ATQ_PRIO = 'AT_PRIO=1 ATQ_WAIT=3';
 
+// Written by the band/slot guard when it changes radio state; used only as a generation
+// marker so this VM notices changes made by that other process.
+const GUARD_STATE = '/var/run/fm350-radio.state';
+// Produced by the detached cell collector. AT+GTCCINFO? is documented <3s and rpcd is
+// SINGLE-THREADED, so calling it inline would freeze every LuCI page for the duration.
+const CELLS_FILE = '/var/run/fm350-cells.json';
+
 // Cached across calls because rpcd keeps the VM loaded: N browser tabs then cost ONE AT
 // transaction per interval instead of N. Without this, two open tabs in live mode would
 // double the load on the scarcest resource on the device.
-let cache = { at: 0, data: null };
+//
+// Keyed cache: one slot per read-group, each with its own TTL.
+//
+// A single slot cannot serve reads whose costs differ by 10x, and the reason is subtler than
+// "different refresh rates": at_locked_batch applies ONE timeout to EVERY command in a batch,
+// and at_exec wraps each in timeout(tmo+2). Batching the cheap +CESQ with the documented-<3s
+// AT+GTCCINFO? therefore drags the whole batch to a 6s timeout and lengthens the worst-case
+// LOCK HOLD for everything in it - on the single AT port the dialer also needs. Cost, not
+// cadence, is what draws the group boundaries below.
+let cache = {};
+
+// Bumped when the band/slot guard changes radio state from another process. That process
+// cannot reach this VM's memory, so volatile entries additionally compare a generation marker
+// - the mtime of the guard's state file - and miss when it has moved.
+function cache_gen() {
+	const st = stat(GUARD_STATE);
+	return st ? st.mtime : 0;
+}
+
+// producer() is only called on a miss. `volatile` marks entries that another process can
+// invalidate; static ones (model, capabilities) skip the stat() entirely.
+function cached(key, ttl, volatile, producer) {
+	const now = time();
+	const gen = volatile ? cache_gen() : 0;
+	const e = cache[key];
+	if (e && (now - e.at) < ttl && e.gen == gen)
+		return { data: e.data, age: now - e.at, cached: true };
+	const data = producer();
+	cache[key] = { at: now, gen: gen, data: data };
+	return { data: data, age: 0, cached: false };
+}
+
+function cache_drop(key) {
+	delete cache[key];
+}
 
 function shq(s) {
 	return "'" + replace(s ?? '', "'", "'\\''") + "'";
@@ -261,6 +302,177 @@ function collect_status() {
 	};
 }
 
+// --- band encoding -------------------------------------------------------------------
+//
+// +GTACT numbers bands as a flat integer list, NOT a bitmask (that is +EPBSEH). Verified
+// against this modem's own AT+GTACT=? on 2026-07-28:
+//   UMTS  1..8        -> B I..VIII
+//   LTE   100 + N     -> 101 = B1  ... 166 = B66, 171 = B71
+//   NR    "50" .. N   -> 501 = n1 ... 509 = n9, then 5020 = n20 ... 50512 = n512
+// The NR form is literal digit concatenation, which is why it is not simply 500+N.
+function band_label(v) {
+	if (v >= 500)
+		return `n${substr('' + v, 2)}`;
+	if (v >= 100)
+		return `B${v - 100}`;
+	return `U${v}`;
+}
+
+function band_group(v) {
+	if (v >= 500) return 'nr';
+	if (v >= 100) return 'lte';
+	return 'umts';
+}
+
+// Split "(a,b,c)" groups out of a +GTACT=? reply. ucode has no (?:...) so this walks the
+// string rather than trying to express nesting in one regex.
+function paren_groups(s) {
+	const out = [];
+	let cur = null;
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+		if (c == '(') { cur = ''; continue; }
+		if (c == ')') { if (cur != null) push(out, cur); cur = null; continue; }
+		if (cur != null) cur += c;
+	}
+	return out;
+}
+
+function int_list(s) {
+	const out = [];
+	for (let p in split(s ?? '', ',')) {
+		const t = trim(p);
+		if (t != '' && match(t, /^[0-9]+$/))
+			push(out, +t);
+	}
+	return out;
+}
+
+// AT+GTACT=? -> (rat),(pref1),(pref2),(gsm),(umts),(lte),(cdma),(evdo),(nr)
+// GSM/CDMA/EV-DO come back empty on this radio; the picker must be built from THIS, not from
+// a hard-coded B1..B71 range, or it would offer bands the hardware does not have.
+function parse_gtact_caps(line) {
+	if (!line)
+		return null;
+	const g = paren_groups(line);
+	if (length(g) < 9)
+		return null;
+	return {
+		rats: int_list(g[0]),
+		umts: int_list(g[4]),
+		lte:  int_list(g[5]),
+		nr:   int_list(g[8])
+	};
+}
+
+// AT+GTACT? -> <rat>,<pref1>,<pref2>[,<band>...]
+function parse_gtact(line) {
+	if (!line)
+		return null;
+	const v = int_list(replace(line, /^\+GTACT:\s*/, ''));
+	if (!length(v))
+		return null;
+	const bands = [];
+	for (let i = 3; i < length(v); i++)
+		push(bands, v[i]);
+	return { rat: v[0], pref1: v[1] ?? null, pref2: v[2] ?? null, bands: bands };
+}
+
+// AT+GTDUALSIM? -> `+GTDUALSIM : 0, "SUB1", "L"`
+// ⚠️ There is a SPACE before the colon and after each comma on this firmware. A regex
+// anchored on `+GTDUALSIM:` does not match. Measured, not guessed.
+function parse_dualsim(line) {
+	const m = line ? match(line, /\+GTDUALSIM\s*:\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"/) : null;
+	if (!m)
+		return {};
+	return { sim_slot: +m[1], sim_sub: m[2], sim_service: m[3] };
+}
+
+// AT+GTCAINFO? -> `PCC:<band>,<pci>,<earfcn>,<dl_bw>,<ul_bw>,<dl_mimo>,<ul_mimo>,<dl_mod>,
+//                       <ul_mod>,<rsrp>` and optional `SCCn:` lines.
+//
+// ⚠️ The manual documents EIGHT fields for PCC; this firmware emits TEN - it omits
+// <ul_bandwidth> and the trailing RSRP from its spec. Parse positionally from the observed
+// shape and tolerate a short reply rather than trusting the documented count.
+function parse_ca_line(line) {
+	const m = match(line, /^(PCC|SCC\d*)\s*:\s*(.*)$/);
+	if (!m)
+		return null;
+	const v = int_list(m[2]);
+	// SCC rows lead with <scell_state>,<ul_configured> before the band; PCC does not.
+	const scc = (m[1] != 'PCC');
+	const o = scc ? 2 : 0;
+	if (length(v) < o + 3)
+		return null;
+	return {
+		carrier: m[1],
+		state: scc ? v[0] : null,
+		band: v[o], band_label: band_label(v[o]),
+		pci: v[o + 1],
+		arfcn: v[o + 2],
+		dl_bandwidth: v[o + 3] ?? null,
+		ul_bandwidth: v[o + 4] ?? null,
+		dl_mimo: v[o + 5] ?? null,
+		ul_mimo: v[o + 6] ?? null,
+		dl_modulation: v[o + 7] ?? null,
+		ul_modulation: v[o + 8] ?? null
+	};
+}
+
+// AT+GTCCINFO? rows. The serving and neighbour rows have DIFFERENT field counts and
+// different meanings - the serving row carries <band> and <bandwidth>, the neighbour row
+// leaves both empty - so they cannot share one positional parser.
+//
+//   serving:   1,<rat>,<mcc>,<mnc>,<tac>,<cellid>,<arfcn>,<pci>,<band>,<bw>,<snr>,<rxlev>,<rsrp>,<rsrq>
+//   neighbour: 2,<rat>,,,<tac>,<cellid>,<arfcn>,<pci>,,<rxlev>,<rsrp>,<rsrq>
+//
+// Conversion here is the rxlev scale of manual §11.1.15, which is NOT the +CESQ scale:
+//   RSRP dBm = v - 140     RSRQ dB = (v/2) - 19.5
+function parse_cell_row(line) {
+	const f = split(trim(line), ',');
+	if (length(f) < 8)
+		return null;
+	const serving = (trim(f[0]) == '1');
+	const rat = +trim(f[1]);
+	if (rat != 2 && rat != 4 && rat != 9)
+		return null;
+
+	const num = function(x) {
+		const t = trim(x ?? '');
+		return (t == '' || !match(t, /^-?[0-9]+$/)) ? null : +t;
+	};
+
+	const row = {
+		serving: serving,
+		rat: rat,
+		rat_name: (rat == 9) ? 'NR' : (rat == 4) ? 'LTE' : 'UMTS',
+		mcc: trim(f[2] ?? '') != '' ? trim(f[2]) : null,
+		mnc: trim(f[3] ?? '') != '' ? trim(f[3]) : null,
+		tac: trim(f[4] ?? '') != '' ? trim(f[4]) : null,
+		cellid: trim(f[5] ?? '') != '' ? trim(f[5]) : null,
+		arfcn: num(f[6]),
+		pci: num(f[7])
+	};
+
+	// Field 9 onwards diverges between the two shapes.
+	let rsrp, rsrq;
+	if (serving) {
+		const b = num(f[8]);
+		row.band = b;
+		row.band_label = (b != null) ? band_label(b) : null;
+		row.bandwidth = num(f[9]);
+		row.snr = num(f[10]);
+		rsrp = num(f[12]);
+		rsrq = num(f[13]);
+	} else {
+		rsrp = num(f[10]);
+		rsrq = num(f[11]);
+	}
+	row.rsrp = (rsrp != null) ? rsrp - 140 : null;
+	row.rsrq = (rsrq != null) ? (rsrq / 2) - 19.5 : null;
+	return row;
+}
+
 // Reassemble concatenated ("multipart") SMS.
 //
 // A GSM SMS carries 140 bytes. Chinese cannot be expressed in GSM 7-bit, so it goes out as
@@ -350,13 +562,137 @@ const methods = {
 	status: {
 		args: { ttl: 0 },
 		call: function(req) {
-			const ttl = req.args?.ttl ?? 15;
-			const now = time();
-			if (cache.data && (now - cache.at) < ttl)
-				return { ...cache.data, cached: true, age: now - cache.at };
-			cache.data = collect_status();
-			cache.at = now;
-			return { ...cache.data, cached: false, age: 0 };
+			// Clamp: the caller is a web page and this drives AT traffic on the port the
+			// dialer needs. A 0 would mean "every render takes the lock".
+			let ttl = req.args?.ttl ?? 15;
+			if (ttl < 2) ttl = 2;
+			if (ttl > 60) ttl = 60;
+			const r = cached('live', ttl, true, collect_status);
+			return { ...r.data, cached: r.cached, age: r.age };
+		}
+	},
+
+	// Carrier aggregation, MIMO and modulation. Its own batch and its own TTL: <1s, but
+	// pointless to refresh on the 3s live tick, and it must not ride along with a command
+	// whose timeout would extend this one's lock hold.
+	ca_info: {
+		call: function() {
+			const r = cached('ca', 15, true, function() {
+				const res = atq_batch([ 'AT+GTCAINFO?' ]);
+				const e = res?.['AT+GTCAINFO?'];
+				const carriers = [];
+				if (e && e.rc == 0)
+					for (let l in e.lines) {
+						const c = parse_ca_line(l);
+						if (c) push(carriers, c);
+					}
+				return { carriers: carriers, reachable: !!(e && e.rc == 0) };
+			});
+			return { ...r.data, cached: r.cached, age: r.age };
+		}
+	},
+
+	// Radio configuration and capabilities. `radio_caps` is immutable per firmware, so it is
+	// cached for a day AND mirrored to /var/run so an rpcd restart does not re-pay for it.
+	radio_info: {
+		call: function() {
+			const cfg = cached('radio_cfg', 30, true, function() {
+				const res = atq_batch([ 'AT+GTACT?', 'AT+GTDUALSIM?', 'AT+SIMTYPE?' ]);
+				const st = first_line(res, 'AT+SIMTYPE?', '+SIMTYPE:');
+				const sm = st ? match(st, /\+SIMTYPE:\s*(\d+)/) : null;
+				return {
+					...(parse_gtact(first_line(res, 'AT+GTACT?', '+GTACT:')) ?? {}),
+					...parse_dualsim(first_line(res, 'AT+GTDUALSIM?', '+GTDUALSIM')),
+					sim_type: sm ? +sm[1] : null,
+					sim_type_name: sm ? (+sm[1] == 1 ? 'eSIM' : 'USIM') : null
+				};
+			});
+
+			const caps = cached('radio_caps', 86400, false, function() {
+				let c = null;
+				const disk = readfile('/var/run/fm350-gtact-caps') ?? '';
+				if (disk != '')
+					c = parse_gtact_caps(trim(disk));
+				if (!c) {
+					// -t 10: the capability reply is long and the default 5s truncates it.
+					const res = atq_batch([ 'AT+GTACT=?' ]);
+					const l = first_line(res, 'AT+GTACT=?', '+GTACT:');
+					c = parse_gtact_caps(l);
+					if (c && l)
+						run(`printf '%s' ${shq(l)} > /var/run/fm350-gtact-caps 2>/dev/null`);
+				}
+				return c ?? { rats: [], umts: [], lte: [], nr: [] };
+			});
+
+			// Labels are derived here rather than in the view so the encoding rule lives in
+			// exactly one place.
+			const label = function(list) {
+				const o = [];
+				for (let b in list) push(o, { value: b, label: band_label(b), group: band_group(b) });
+				return o;
+			};
+
+			return {
+				...cfg.data,
+				band_labels: label(cfg.data?.bands ?? []),
+				caps: {
+					rats: caps.data.rats,
+					bands: label([ ...caps.data.umts, ...caps.data.lte, ...caps.data.nr ])
+				},
+				cached: cfg.cached, age: cfg.age
+			};
+		}
+	},
+
+	// Neighbour cells. NEVER runs the AT command inline: rpcd is single-threaded, so a <3s
+	// command plus lock wait would freeze every LuCI page, not just this one. A detached
+	// collector writes CELLS_FILE atomically and this only reads it, returning the last known
+	// data with `pending` set while a refresh is in flight. N tabs coalesce on the
+	// collector's own flock rather than on tab count.
+	cells: {
+		args: { refresh: 0 },
+		call: function(req) {
+			const want = req.args?.refresh ?? 0;
+			const raw = readfile(CELLS_FILE) ?? '';
+			let doc = null;
+			try { doc = json(raw); } catch (e) { doc = null; }
+
+			// Age from the file's mtime, not from a timestamp written into it. That keeps
+			// `date +%s` out of the collector entirely - this board has no RTC and the clock
+			// steps at boot - and clamping at zero means a backwards step shows "just now"
+			// rather than a negative age.
+			const st = stat(CELLS_FILE);
+			let age = st ? (time() - st.mtime) : null;
+			if (age != null && age < 0) age = 0;
+
+			const stale = (doc == null) || (age == null) || (age > 60) || want;
+			if (stale)
+				run('/usr/sbin/fm350-collect-cells >/dev/null 2>&1');
+
+			const rows = [];
+			for (let l in (doc?.lines ?? [])) {
+				const c = parse_cell_row(l);
+				if (c) push(rows, c);
+			}
+			// Serving cell first, then neighbours strongest-first: the useful reading order.
+			sort(rows, function(a, b) {
+				if (a.serving != b.serving) return a.serving ? -1 : 1;
+				return (b.rsrp ?? -999) - (a.rsrp ?? -999);
+			});
+
+			// Hard cap. Up to ten neighbours PER RAT can be reported, and an oversized
+			// blobmsg makes the ubus call fail outright rather than truncate - the page
+			// would show nothing at all instead of a shortened list.
+			const capped = length(rows) > 12;
+			return {
+				cells: capped ? slice(rows, 0, 12) : rows,
+				truncated: capped,
+				age: age,
+				// `pending` means "a refresh is running; this may be older than it looks" -
+				// rendered as a note, never as a spinner that never resolves.
+				pending: stale,
+				reachable: doc ? (doc.reachable ?? false) : false
+			};
 		}
 	},
 
@@ -448,7 +784,7 @@ const methods = {
 	reconnect: {
 		call: function() {
 			run(`/sbin/ifdown ${IFACE} 2>/dev/null; /sbin/ifup ${IFACE} 2>/dev/null`);
-			cache.at = 0;
+			cache_drop('live');
 			return { ok: true };
 		}
 	},
@@ -467,7 +803,7 @@ const methods = {
 			// `/etc/init.d/rpcd restart` during the 8s window - which LuCI itself triggers on
 			// package install - would strand the modem at authorized=0 until a power cycle.
 			run('/usr/sbin/fm350-usb-reset >/dev/null 2>&1');
-			cache.at = 0;
+			cache_drop('live');
 			return { ok: true, usb_path: path, note: 'reset started; allow ~70s' };
 		}
 	},

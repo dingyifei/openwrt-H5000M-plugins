@@ -1,0 +1,112 @@
+#!/bin/sh
+# Collect serving + neighbour cell information into /var/run/fm350-cells.json.
+#
+# ⚠️ WHY A SEPARATE COLLECTOR, rather than letting the LuCI backend run the command:
+# rpcd is SINGLE-THREADED. A blocking popen() in the ucode backend freezes rpcd's entire
+# event loop, so every LuCI page - not just this one - stops responding for the duration.
+# AT+GTCCINFO? is documented at <3s and, with lock wait and the at_exec margin on top, a
+# synchronous call could stall the whole web UI for the better part of ten seconds.
+#
+# So the backend only ever READS this file and never blocks. This program does the waiting,
+# detached, and publishes the result atomically. N browser tabs asking at once coalesce on
+# the flock below rather than each launching a query.
+#
+# The output deliberately carries the RAW response lines rather than parsed fields: the
+# serving and neighbour rows have different shapes, and keeping exactly one parser (in the
+# ucode backend, where the +CESQ and +COPS parsers already live) is worth more than making
+# this file self-describing. A second parser here would drift from that one.
+#
+# usage: fm350-collect-cells           detach and return immediately
+#        fm350-collect-cells --wait    collect synchronously
+
+ATIO=/usr/lib/h5000m/atio.sh
+OUT=/var/run/fm350-cells.json
+LOCK=/var/lock/fm350-cells.lock
+
+# Cosmetic data for a web page: it must never delay the dialer, and a short wait means a busy
+# port surfaces as stale data rather than as a queue of collectors piling up behind the lock.
+AT_PRIO=1
+export AT_PRIO
+
+MODE=detach
+case "${1:-}" in
+	'')       MODE=detach ;;
+	--wait)   MODE=wait ;;
+	--worker) MODE=worker ;;
+	-h|--help)
+		echo "usage: fm350-collect-cells [--wait]"
+		exit 0
+		;;
+	*) echo "usage: fm350-collect-cells [--wait]" >&2; exit 2 ;;
+esac
+
+[ -r "$ATIO" ] || { echo "fm350-collect-cells: $ATIO not found" >&2; exit 1; }
+. "$ATIO"
+
+collect() {
+	# -n: if another collector already holds this, its result will be just as fresh as ours
+	# would have been, so exit rather than queue. This is what makes N tabs cost one query.
+	flock -n -x 9 2>/dev/null || exit 0
+
+	at_state_load 2>/dev/null || {
+		printf '{"reachable":false,"lines":[]}\n' > "$OUT.$$" 2>/dev/null
+		mv -f "$OUT.$$" "$OUT" 2>/dev/null
+		exit 0
+	}
+
+	_raw=$(atq -t 12 'AT+GTCCINFO?' 2>/dev/null)
+	_rc=$?
+
+	{
+		if [ "$_rc" = 0 ]; then
+			printf '{"reachable":true,"lines":['
+		else
+			printf '{"reachable":false,"lines":['
+		fi
+
+		# Only rows that look like cell records: a leading 1 or 2 (serving/neighbour) and a
+		# RAT digit. This drops the "+GTCCINFO:" header and any stray URC that arrived
+		# mid-transaction - URCs land in this stream because nobody holds the port between
+		# commands, so filtering here is not optional.
+		#
+		# Values are digits, commas and hex only, so the character class below is a whitelist
+		# rather than an escape: nothing that reaches the JSON can carry a quote or backslash.
+		_first=1
+		printf '%s\n' "$_raw" | while IFS= read -r _l; do
+			_c=$(printf '%s' "$_l" | tr -dc '0-9A-Fa-f,')
+			case "$_c" in
+				1,*|2,*) ;;
+				*) continue ;;
+			esac
+			[ "$_first" = 1 ] || printf ','
+			_first=0
+			printf '"%s"' "$_c"
+		done
+
+		printf ']}\n'
+	} > "$OUT.$$" 2>/dev/null
+
+	# Atomic publish: a reader must never see a half-written file. The backend reads this
+	# without any lock at all, which is only safe because of the rename.
+	mv -f "$OUT.$$" "$OUT" 2>/dev/null
+	rm -f "$OUT.$$" 2>/dev/null
+}
+
+case "$MODE" in
+	worker|wait)
+		mkdir -p /var/lock
+		( collect ) 9>"$LOCK"
+		;;
+	detach)
+		# New session, so a caller going away - or rpcd being restarted, which is how the
+		# backend invokes this - cannot kill the collection mid-flight and leave a stale
+		# temp file behind.
+		if command -v setsid >/dev/null 2>&1; then
+			setsid "$0" --worker </dev/null >/dev/null 2>&1 &
+		else
+			"$0" --worker </dev/null >/dev/null 2>&1 &
+		fi
+		;;
+esac
+
+exit 0
