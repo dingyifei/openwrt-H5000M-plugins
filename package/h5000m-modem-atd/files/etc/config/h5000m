@@ -1,0 +1,42 @@
+# H5000M runtime configuration. Logging is deliberately UCI-driven rather than baked in:
+# diagnosing a modem fault should never require rebuilding and reflashing firmware, least
+# of all on a device being administered remotely.
+#
+# level: error | warn | info | debug | trace
+#   error  the thing failed and stays failed
+#   warn   degraded, self-correcting, or retrying
+#   info   state transitions worth keeping (activated, published, bearer lost)   [default]
+#   debug  decisions and branches - which APN ladder rung, which candidate port
+#   trace  the AT wire itself: every command and response
+#
+# Per-component keys override the global level. Components: fm350 (dialer),
+# modem_atd (AT layer), sms, esim. Leave empty to inherit.
+#
+#   uci set h5000m.logging.fm350=trace; uci commit h5000m
+#
+# ⚠️ Levels are read ONCE when a process starts. Short-lived tools (atq, h5000m-sms) pick
+# up a change on their next run, but a LONG-LIVED process does not: to raise the dialer's
+# level you must restart it - `ifdown cellular; ifup cellular` - or it keeps the level it
+# started with. No reboot and no rebuild, but not zero-touch either.
+#
+# ⚠️ A process logs under ONE component. The dialer sources the AT layer, so inside the
+# dialer everything - including AT traces - is governed by `fm350`, and `modem_atd` there
+# has no effect. `modem_atd` governs the AT layer in its own tools (atq, at-lease).
+
+config logging 'logging'
+	option level 'info'
+	option fm350 ''
+	option modem_atd ''
+	option sms ''
+	option esim ''
+	# Identifier masking. AT traffic carries IMSI, ICCID, EID, phone numbers and whole SMS
+	# bodies; syslog can be forwarded off-box. Applies at EVERY level, not just trace -
+	# an ICCID in a warning is exactly as sensitive as one in a trace. On by default;
+	# turning it off logs a warning. Set it back when you are done.
+	option trace_redact '1'
+	# Identical CONSECUTIVE messages collapse into one line plus "(repeated N times)".
+	# The run is flushed when a different message is logged, or at this count - the cap
+	# exists so a long-lived process cannot sit forever on an un-emitted counter.
+	# This is a repeat COUNT, not a time window: taking a timestamp per line would cost a
+	# fork per log call, which is the thing this library is built to avoid.
+	option dedup_max '50'

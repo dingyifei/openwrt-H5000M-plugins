@@ -13,8 +13,14 @@
 H5000M_LOCKDIR=/var/lock
 H5000M_MODEM_STATE=/var/run/h5000m-modem.state
 
-at_log() { logger -t h5000m-modem -p daemon.info "$*"; }
-at_warn() { logger -t h5000m-modem -p daemon.warn "$*"; }
+# shellcheck disable=SC1091
+. /usr/lib/h5000m/log.sh
+h5000m_log_init modem_atd
+
+# Kept as thin wrappers so every existing caller keeps working while the levels become
+# real. Note these take a plain string, not a format - callers pass pre-built messages.
+at_log()  { log_info  '%s' "$*"; }
+at_warn() { log_warn  '%s' "$*"; }
 
 # at_lockfile <usbpath> <ifnum> -> path of the lock guarding that physical port
 at_lockfile() {
@@ -44,7 +50,11 @@ at_exec() {
 	_ap_cmd="$2"
 	_ap_tmo="${3:-5}"
 
-	at_port_setup "$_ap_dev" || return 1
+	# _AT_SKIP_SETUP is set only by at_locked_batch, which does the stty once before its
+	# loop while holding the lock. Deliberately NOT a general "remember the last device"
+	# memo: this modem re-enumerates on its own, and a cached "already configured" that
+	# outlived a re-enumeration would silently talk to an unconfigured port.
+	[ -n "${_AT_SKIP_SETUP:-}" ] || at_port_setup "$_ap_dev" || return 1
 
 	_ap_raw=$(timeout $(( _ap_tmo + 2 )) sh -c '
 		_cr=$(printf "\r")
@@ -61,6 +71,12 @@ at_exec() {
 			esac
 		done
 	' _ "$_ap_dev" "$_ap_cmd" "$_ap_tmo" 2>/dev/null)
+
+	# The AT wire, at trace level only. This is the view that did not exist while debugging
+	# the activation model, when the modem's actual replies had to be inferred from
+	# behaviour. Redaction is applied inside the logger, not here, so every trace site
+	# gets it automatically rather than each remembering to.
+	log_trace '> %s' "$_ap_cmd"
 
 	_ap_out=""
 	_ap_rc=3
@@ -88,6 +104,15 @@ at_exec() {
 		esac
 	done
 	IFS="$_ap_oldifs"
+
+	# Collapse the transcript onto one line: syslog records per line, and a multi-line
+	# response would otherwise be interleaved with whatever else is logging.
+	#
+	# GUARDED, because the collapse costs a subshell and a `tr` - three forks - and
+	# without the guard they were paid on EVERY AT command at the default level only to
+	# throw the result away. The dialer polls every 30s and the web UI will poll every few
+	# seconds, so this is the hottest line in the stack.
+	log_want trace && log_trace '< [rc=%s] %s' "$_ap_rc" "$(printf '%s' "$_ap_out" | tr '\n' '|')"
 
 	printf '%s' "$_ap_out"
 	return "$_ap_rc"
@@ -167,59 +192,88 @@ at_probe() {
 # deliberately not described as a guarantee.
 : "${AT_PRIO:=10}"
 
-at_prio_file() { printf '%s.want' "$1"; }
-
 # Entries are "<pid> <prio>". A dead pid's entry is ignored and reaped on the next rewrite,
 # so a consumer killed mid-wait cannot block anyone forever.
+#
+# NOTE on $$: inside at_locked's subshell this is the PARENT shell's pid, not the
+# subshell's. That is fine and in fact wanted - it is stable for the lifetime of the
+# consumer process, which is exactly the identity we want to register and reap.
 _at_prio_add() { printf '%s %s\n' "$$" "${AT_PRIO:-10}" >> "$1" 2>/dev/null; }
+
+# One walk, two consumers. Emits the live entries that are not ours, so the reaper and the
+# max-priority query share a single definition of "live and not mine" instead of drifting.
+_at_prio_live() {
+	[ -f "$1" ] || return 0
+	while read -r _pl_pid _pl_val; do
+		[ "$_pl_pid" = "$$" ] && continue
+		[ -d "/proc/$_pl_pid" ] || continue
+		case "$_pl_val" in ''|*[!0-9]*) continue ;; esac
+		printf '%s %s\n' "$_pl_pid" "$_pl_val"
+	done < "$1" 2>/dev/null
+}
 
 _at_prio_del() {
 	[ -f "$1" ] || return 0
 	_pd_tmp="$1.$$"
-	while read -r _pd_pid _pd_val; do
-		[ "$_pd_pid" = "$$" ] && continue
-		[ -d "/proc/$_pd_pid" ] || continue
-		printf '%s %s\n' "$_pd_pid" "$_pd_val"
-	done < "$1" > "$_pd_tmp" 2>/dev/null
+	_at_prio_live "$1" > "$_pd_tmp" 2>/dev/null
 	mv -f "$_pd_tmp" "$1" 2>/dev/null || rm -f "$_pd_tmp" 2>/dev/null
 	return 0
 }
 
-_at_prio_max_other() {
-	_pm_max=0
-	if [ -f "$1" ]; then
-		while read -r _pm_pid _pm_val; do
-			[ "$_pm_pid" = "$$" ] && continue
-			[ -d "/proc/$_pm_pid" ] || continue
-			case "$_pm_val" in ''|*[!0-9]*) continue ;; esac
-			[ "$_pm_val" -gt "$_pm_max" ] && _pm_max="$_pm_val"
-		done < "$1" 2>/dev/null
-	fi
-	printf '%s' "$_pm_max"
+# Assigns _AT_PRIO_MAX rather than printing it: a printing helper has to be called through
+# $( ), which is a fork, and this runs once per second per waiter.
+_at_prio_scan() {
+	_AT_PRIO_MAX=0
+	[ -f "$1" ] || return 0
+	while read -r _ps_pid _ps_val; do
+		[ "$_ps_pid" = "$$" ] && continue
+		[ -d "/proc/$_ps_pid" ] || continue
+		case "$_ps_val" in ''|*[!0-9]*) continue ;; esac
+		[ "$_ps_val" -gt "$_AT_PRIO_MAX" ] && _AT_PRIO_MAX="$_ps_val"
+	done < "$1" 2>/dev/null
+	return 0
 }
 
-# at_flock_wait <wait_seconds> [lockfile]
-# The lockfile is optional only so an old caller keeps working; pass it to get priority.
+# at_flock_wait <wait_seconds> <lockfile>
+#
+# The lockfile is REQUIRED. It was briefly optional "so an old caller keeps working", but
+# every caller lives in this repo and was updated in the same change - so the only thing
+# optionality bought was a silent-degradation mode where a caller that forgot the argument
+# got no priority participation and no warning.
+#
+# The loop sleeps exactly one second, so the deadline is a fork-free countdown rather than
+# a `date +%s` per iteration.
 at_flock_wait() {
-	_fw_end=$(( $(date +%s) + ${1:-10} ))
-	_fw_pf=''
-	[ -n "${2:-}" ] && { _fw_pf="$(at_prio_file "$2")"; _at_prio_add "$_fw_pf"; }
+	_fw_left="${1:-10}"
+	_fw_pf="$2.want"
+	_at_prio_add "$_fw_pf"
+	_fw_rc=1
 
 	while :; do
-		if [ -n "$_fw_pf" ] && [ "$(_at_prio_max_other "$_fw_pf")" -gt "${AT_PRIO:-10}" ]; then
-			: # something more important is waiting - do not race it
-		elif flock -n -x 9 2>/dev/null; then
-			[ -n "$_fw_pf" ] && _at_prio_del "$_fw_pf"
-			return 0
+		_at_prio_scan "$_fw_pf"
+		if [ "$_AT_PRIO_MAX" -le "${AT_PRIO:-10}" ] && flock -n -x 9 2>/dev/null; then
+			_fw_rc=0
+			break
 		fi
-		if [ "$(date +%s)" -ge "$_fw_end" ]; then
-			[ -n "$_fw_pf" ] && _at_prio_del "$_fw_pf"
-			return 1
-		fi
+		[ "$_fw_left" -gt 0 ] || break
+		_fw_left=$(( _fw_left - 1 ))
 		sleep 1
 	done
+
+	_at_prio_del "$_fw_pf"
+	return "$_fw_rc"
 }
 
+# at_locked <lockfile> <wait> <devnode> <command> [timeout]
+# at_locked_batch <lockfile> <wait> <devnode> <timeout> <command>...
+#
+# Both hold the port for their whole run. Batch exists because the single AT port is the
+# scarcest resource on this device: a status page needs half a dozen queries, and run one
+# at a time they cost six acquisitions, six chances to interleave with the dialer and six
+# chances to be told the port is busy. Batched they cost one.
+#
+# Callers must not open-code the mkdir + `( ) 9>lock` dance - that convention living in
+# more than one place is how the two implementations drift apart.
 at_locked() {
 	_al_lock="$1"; _al_wait="$2"; shift 2
 	mkdir -p "$H5000M_LOCKDIR"
@@ -227,6 +281,22 @@ at_locked() {
 		at_flock_wait "$_al_wait" "$_al_lock" || exit 4
 		at_exec "$@"
 	) 9>"$_al_lock"
+}
+
+at_locked_batch() {
+	_ab_lock="$1"; _ab_wait="$2"; _ab_dev="$3"; _ab_tmo="$4"; shift 4
+	mkdir -p "$H5000M_LOCKDIR"
+	(
+		at_flock_wait "$_ab_wait" "$_ab_lock" || exit 4
+		# One stty for the whole held run instead of one per command.
+		at_port_setup "$_ab_dev" || exit 1
+		_AT_SKIP_SETUP=1
+		for _ab_cmd in "$@"; do
+			printf '@@CMD %s\n' "$_ab_cmd"
+			at_exec "$_ab_dev" "$_ab_cmd" "$_ab_tmo"
+			printf '@@RC %s\n' "$?"
+		done
+	) 9>"$_ab_lock"
 }
 
 # at_state_load - export USBPATH / AT_A / AT_B / AT_A_IF / AT_B_IF / NETDEV

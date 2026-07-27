@@ -25,8 +25,13 @@ set -u
 . /usr/lib/h5000m/atio.sh
 . /usr/lib/h5000m/modem-discover.sh
 
-: "${AT_PRIO:=10}"
-export AT_PRIO
+# AT_PRIO is defaulted by atio.sh, sourced above; repeating it here would be a second
+# place to keep the tier table in step.
+
+usage() {
+	echo "usage: atq [-t seconds] 'AT+COMMAND'"
+	echo "       atq [-t seconds] -b 'AT+CMD1' 'AT+CMD2' ..."
+}
 
 TIMEOUT=5
 BATCH=0
@@ -34,45 +39,44 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 		-t) TIMEOUT="$2"; shift 2 ;;
 		-b) BATCH=1; shift ;;
-		-h|--help)
-			echo "usage: atq [-t seconds] 'AT+COMMAND'"
-			echo "       atq [-t seconds] -b 'AT+CMD1' 'AT+CMD2' ..."
-			exit 0
-			;;
+		-h|--help) usage; exit 0 ;;
 		--) shift; break ;;
 		-*) echo "atq: unknown option $1" >&2; exit 4 ;;
 		*) break ;;
 	esac
 done
 
-[ $# -ge 1 ] || { echo "usage: atq [-t seconds] [-b] 'AT+COMMAND' ..." >&2; exit 4; }
+[ $# -ge 1 ] || { usage >&2; exit 4; }
 
 # Commands that either block the port for minutes or belong exclusively to the dialer's
 # state machine. Refusing them here is what keeps a casual query from wedging the modem for
 # everyone - the vendor firmware's single semaphore had no such guard and a stray
 # AT+COPS=? would stall the whole stack.
-atq_refuse() {
-	case "$(echo "$1" | tr 'a-z' 'A-Z' | tr -d ' ')" in
-		AT+COPS=?*)
+#
+# Matched with case-insensitive glob classes rather than by normalising through
+# `echo | tr | tr` - that was three forks per command, i.e. eighteen for a six-command
+# status batch, several hundred a minute once a web UI polls.
+atq_check() {
+	case "$1" in
+		[Aa][Tt]+[Cc][Oo][Pp][Ss]=\?*|[Aa][Tt]+[Cc][Oo][Pp][Ss]=" "*\?*)
 			echo "atq: refusing AT+COPS=? - a network scan blocks this port for minutes" >&2
-			return 0
+			exit 4
 			;;
-		AT+CFUN=*)
+		[Aa][Tt]+[Cc][Ff][Uu][Nn]=*)
 			echo "atq: refusing AT+CFUN= - radio state belongs to the dialer" >&2
-			return 0
+			exit 4
 			;;
-		AT+CGDCONT=1,*)
+		[Aa][Tt]+[Cc][Gg][Dd][Cc][Oo][Nn][Tt]=1,*)
 			echo "atq: refusing AT+CGDCONT=1, - PDP context 1 belongs to the dialer" >&2
-			return 0
+			exit 4
 			;;
 	esac
-	return 1
 }
 
 # Screen EVERY command before taking the lock, so one bad entry in a batch cannot get the
 # port taken and then abort halfway through, leaving the modem mid-conversation.
 for _c in "$@"; do
-	atq_refuse "$_c" && exit 4
+	atq_check "$_c"
 done
 
 at_state_load || modem_discover_locked || { echo "atq: no modem" >&2; exit 1; }
@@ -81,21 +85,10 @@ at_state_load || { echo "atq: no modem state" >&2; exit 1; }
 LOCK=$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_B_IF")
 
 if [ "$BATCH" = 1 ]; then
-	mkdir -p "$H5000M_LOCKDIR"
-	(
-		at_flock_wait "${ATQ_WAIT:-10}" "$LOCK" || exit 4
-		for _c in "$@"; do
-			printf '@@CMD %s\n' "$_c"
-			at_exec "$MODEM_AT_B" "$_c" "$TIMEOUT"
-			printf '@@RC %s\n' "$?"
-		done
-	) 9>"$LOCK"
-	rc=$?
-	[ "$rc" = 4 ] && echo "atq: AT port busy" >&2
-	exit "$rc"
+	at_locked_batch "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$TIMEOUT" "$@"
+else
+	at_locked "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$1" "$TIMEOUT"
 fi
-
-at_locked "$LOCK" "${ATQ_WAIT:-10}" "$MODEM_AT_B" "$1" "$TIMEOUT"
 rc=$?
 [ "$rc" = 4 ] && echo "atq: AT port busy" >&2
 exit "$rc"

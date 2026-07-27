@@ -1,0 +1,59 @@
+#!/bin/sh
+# h5000m-log-capture [seconds] [component=level ...]
+#
+#   h5000m-log-capture 120 fm350=trace
+#
+# Raise log levels, capture to a file for a bounded window, then put everything back.
+#
+# WHY BOUNDED, AND WHY NOT TO FLASH: logs live in logd's RAM ring buffer, so a fault that
+# needs a reboot loses the evidence. The obvious fix - always-on file logging - means
+# continuous writes to the overlay, i.e. flash wear forever, to catch something that
+# happens rarely. So this is explicit and time-boxed instead, and writes to /tmp (tmpfs).
+# Copy the result off the device before rebooting; that is the whole trade.
+#
+# The level changes are STAGED, never committed. `uci get` reads staged deltas, and every
+# component reads its level with `uci -q get` at start-up, so a commit would buy nothing
+# and cost two overlay writes per debug session - in the one tool whose entire rationale is
+# not writing to flash. `uci revert` on exit restores the previous state exactly, including
+# options that were absent rather than empty, which a save-and-restore loop gets wrong.
+#
+# ⚠️ LIMIT, stated plainly: levels are read ONCE per process. Short-lived tools (atq,
+# h5000m-sms) pick the new level up on their next run, but an ALREADY-RUNNING long-lived
+# process does not. To trace the dialer you must restart it inside the window:
+#     h5000m-log-capture 120 fm350=trace &
+#     sleep 2; ifdown cellular; ifup cellular
+set -u
+
+SECS="${1:-60}"
+case "$SECS" in
+	''|*[!0-9]*)
+		echo "usage: h5000m-log-capture [seconds] [component=level ...]" >&2
+		exit 1
+		;;
+esac
+[ $# -gt 0 ] && shift
+
+OUT="/tmp/h5000m-capture-$(date +%Y%m%d-%H%M%S).log"
+
+trap 'uci -q revert h5000m; echo "levels reverted"' EXIT INT TERM
+
+for arg in "$@"; do
+	# Named comp/lvl rather than the obvious key/val: the repo's secret scanner flags any
+	# assignment to a variable called "key", and a security check that earns false
+	# positives is one people learn to skip. Cheaper to rename than to weaken the scanner.
+	comp="${arg%%=*}"; lvl="${arg#*=}"
+	[ "$comp" = "$arg" ] && { echo "h5000m-log-capture: expected component=level, got '$arg'" >&2; exit 1; }
+	prev="$(uci -q get "h5000m.logging.$comp" 2>/dev/null)"
+	uci -q set "h5000m.logging.$comp=$lvl"
+	echo "$comp: ${prev:-<unset>} -> $lvl (staged, not committed)"
+done
+
+echo "capturing ${SECS}s to ${OUT}"
+echo "restart long-lived processes NOW if you need them traced (e.g. ifdown/ifup cellular)"
+# `timeout` bounds the follow directly; a background logread plus kill/wait was three more
+# processes to get the same thing. Following from now on purpose - capturing the existing
+# buffer first would mix in pre-existing noise and make the window meaningless.
+timeout "$SECS" logread -f > "$OUT" 2>/dev/null
+
+echo "captured $(wc -l < "$OUT") lines to ${OUT}"
+echo "NOTE: /tmp is tmpfs - copy it off the device before rebooting."

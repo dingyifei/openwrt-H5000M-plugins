@@ -105,8 +105,12 @@ echo "== uci-defaults must not create anonymous wireless sections =="
 # `uci add wireless wifi-iface` yields an anonymous section, which is precisely what LuCI's
 # wireless-migration prompt exists to rewrite - and it restarts the network to do it. Name
 # the section instead so a fresh flash never greets the user with that dialog.
-if find "$PKGDIR" -type f -path '*/files/etc/uci-defaults/*' -exec sh -c 'sed -e "s/[[:space:]]*#.*$//" "$1"' _ {} \; \
-		| grep -qE 'uci[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*add[[:space:]]+wireless'; then
+_anon=0
+for f in $(find "$PKGDIR" -type f -path '*/files/etc/uci-defaults/*' | sort); do
+	code_of "$f" | grep -qE 'uci[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*add[[:space:]]+wireless' \
+		&& _anon=1
+done
+if [ "$_anon" -eq 1 ]; then
 	bad "uci add wireless creates an anonymous section"
 else
 	ok "no anonymous wireless sections created"

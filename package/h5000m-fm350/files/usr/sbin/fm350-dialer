@@ -15,6 +15,11 @@
 
 . /lib/functions.sh
 . /lib/netifd/netifd-proto.sh
+# Sourced explicitly even though atio.sh also pulls it in: the dialer calls
+# h5000m_log_init directly, and depending on another file's source order for a symbol we
+# use ourselves is the kind of coupling that breaks silently later. The library is
+# idempotent, so sourcing it twice costs nothing.
+. /usr/lib/h5000m/log.sh
 . /usr/lib/h5000m/atio.sh
 . /usr/lib/h5000m/modem-discover.sh
 
@@ -54,8 +59,15 @@ BLACKHOLE=0
 LAST_TX=0
 LAST_RX=0
 
-log()  { logger -t "fm350[$INTERFACE]" -p daemon.info "$*"; }
-warn() { logger -t "fm350[$INTERFACE]" -p daemon.warn "$*"; }
+# Re-init after atio.sh (which registers itself as modem_atd): inside THIS process every
+# line, including the AT traces atio.sh emits, belongs to the dialer and should be governed
+# by h5000m.logging.fm350. One component per process keeps the config predictable.
+# The tag keeps the interface name; the UCI key deliberately does not, because a key you
+# cannot guess is a key nobody sets.
+h5000m_log_init fm350 "fm350[$INTERFACE]"
+
+log()  { log_info '%s' "$*"; }
+warn() { log_warn '%s' "$*"; }
 
 cleanup() { rm -f "$PIDFILE"; }
 trap cleanup EXIT
@@ -193,6 +205,7 @@ publish() {
 # command that exits, so failing FAST is the dangerous behaviour here, not failing slowly.
 MODEM_WAIT=120
 _md_end=$(( $(date +%s) + MODEM_WAIT ))
+_md_said=0
 while :; do
 	at_state_load && [ -n "$MODEM_NETDEV" ] && break
 	modem_discover_locked >/dev/null 2>&1
@@ -208,7 +221,16 @@ while :; do
 		proto_block_restart "$INTERFACE"
 		exit 1
 	fi
-	log "waiting for the modem to finish coming up"
+	# Announce the wait ONCE at info, then drop to debug. A dozen identical info lines
+	# says nothing the first one did not, and on a fixed-size ring buffer the repeats
+	# actively cost you other subsystems' logs. The generic repeat-collapsing in log.sh is
+	# a backstop, not a licence to log in a loop.
+	if [ "$_md_said" = 0 ]; then
+		log "waiting for the modem to finish coming up"
+		_md_said=1
+	else
+		log_debug 'still waiting for the modem (%ss left)' "$(( _md_end - $(date +%s) ))"
+	fi
 	sleep 10
 done
 

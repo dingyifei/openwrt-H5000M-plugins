@@ -38,10 +38,25 @@ if [ -n "$target_radio" ]; then
 	# prompt ("无线配置迁移") exists to rename - it offers to rewrite it as wifinet# and
 	# RESTART THE NETWORK, which is a hostile thing to hand a user on first login. The
 	# lookup above matches on mode+network, so an already-migrated wifinet0 is adopted
-	# rather than duplicated; this only changes what fresh flashes create.
+	# rather than duplicated.
 	if [ -z "$sta_section" ]; then
 		sta_section='wireless.h5000m_sta'
 		uci -q set "${sta_section}=wifi-iface"
+	else
+		# Adopting a section this script created ANONYMOUSLY on an earlier release: rename
+		# it in place. Creating named sections only helps machines flashed after today,
+		# and the units that actually have the problem are the ones already deployed -
+		# a fix that skips them is not much of a fix. uci generates anonymous names as
+		# cfg<hex>; anything else (including LuCI's own wifinet0) is already named and is
+		# left exactly as the user has it.
+		case "${sta_section#wireless.}" in
+			cfg[0-9a-f]*)
+				if uci -q rename "${sta_section}=h5000m_sta"; then
+					sta_section='wireless.h5000m_sta'
+					logger -t h5000m-travelmate "renamed anonymous STA section to h5000m_sta"
+				fi
+				;;
+		esac
 	fi
 
 	# Attach to the preferred radio only when unset, so a Travelmate retarget survives re-runs.

@@ -38,6 +38,7 @@ endef
 
 define Package/h5000m-modem-atd/install
 	$(INSTALL_DIR) $(1)/usr/lib/h5000m
+	$(INSTALL_DATA) ./files/usr/lib/h5000m/log.sh $(1)/usr/lib/h5000m/log.sh
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/atio.sh $(1)/usr/lib/h5000m/atio.sh
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/modem-discover.sh \
 		$(1)/usr/lib/h5000m/modem-discover.sh
@@ -45,6 +46,9 @@ define Package/h5000m-modem-atd/install
 	$(INSTALL_BIN) ./files/usr/sbin/atq $(1)/usr/sbin/atq
 	$(INSTALL_BIN) ./files/usr/sbin/at-lease $(1)/usr/sbin/at-lease
 	$(INSTALL_BIN) ./files/usr/sbin/modem-ports $(1)/usr/sbin/modem-ports
+	$(INSTALL_BIN) ./files/usr/sbin/h5000m-log-capture $(1)/usr/sbin/h5000m-log-capture
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/etc/config/h5000m $(1)/etc/config/h5000m
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/tty
 	$(INSTALL_DATA) ./files/etc/hotplug.d/tty/20-h5000m-modem \
 		$(1)/etc/hotplug.d/tty/20-h5000m-modem
