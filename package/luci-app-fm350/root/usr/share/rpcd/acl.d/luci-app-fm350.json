@@ -1,6 +1,6 @@
 {
 	"luci-app-fm350": {
-		"description": "Grant access to FM350 modem status, SMS and recovery actions",
+		"description": "Grant access to FM350 modem status, cells, SMS, radio configuration and recovery",
 		"read": {
 			"ubus": {
 				"luci.fm350": [
@@ -26,7 +26,10 @@
 					"sim_set",
 					"sim_confirm"
 				]
-			}
+			},
+			"uci": [
+				"network"
+			]
 		}
 	}
 }

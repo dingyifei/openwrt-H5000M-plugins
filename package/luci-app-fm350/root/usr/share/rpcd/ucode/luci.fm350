@@ -689,11 +689,20 @@ const methods = {
 				return o;
 			};
 
+			// RATs are labelled HERE, not in the view. The view needs a name per mode, and
+			// a second copy of the §11.1.14 enumeration in JavaScript would drift from this
+			// one the moment either is extended - silently, since a wrong mode name still
+			// renders. One source, shipped as {value,label} like the bands already are.
+			const rat_opts = [];
+			for (let r in (caps.data.rats ?? []))
+				push(rat_opts, { value: r, label: gtact_rat_name(r) });
+
 			return {
 				...cfg.data,
 				band_labels: label(cfg.data?.bands ?? []),
 				caps: {
 					rats: caps.data.rats,
+					rat_options: rat_opts,
 					bands: label([ ...caps.data.umts, ...caps.data.lte, ...caps.data.nr ])
 				},
 				cached: cfg.cached, age: cfg.age

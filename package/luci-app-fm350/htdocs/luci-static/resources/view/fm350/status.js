@@ -33,6 +33,14 @@ var callReconnect = rpc.declare({ object: 'luci.fm350', method: 'reconnect', exp
 var callReset     = rpc.declare({ object: 'luci.fm350', method: 'reset_modem', expect: { '': {} } });
 var callResetStat = rpc.declare({ object: 'luci.fm350', method: 'reset_status', expect: { '': {} } });
 
+// A SIM slot switch made on the Radio page does not auto-persist: it self-reverts at the
+// second reboot unless confirmed. That confirm must be reachable from wherever the user
+// lands, so the banner and its Keep button live on the status page too. radio_state is pure
+// file reads (no AT), so polling it cheaply on its own tick is fine.
+var BANNER = 10;
+var callRadioState = rpc.declare({ object: 'luci.fm350', method: 'radio_state', expect: { '': {} } });
+var callSimConfirm = rpc.declare({ object: 'luci.fm350', method: 'sim_confirm', expect: { '': {} } });
+
 // Unavailable is rendered as a dash, never as a number. +CESQ reports 255 for metrics that
 // do not apply to the current radio technology, and printing that as "255 dBm" would be
 // worse than printing nothing.
@@ -245,12 +253,17 @@ return view.extend({
 			[ _('Type'), val(ri.sim_type_name) ]
 		]));
 
-		// Bands / RAT (radio_info). "auto" is derived from the capability set, not a decoded
-		// mode register - see bandSummary().
+		// Bands / RAT (radio_info). The RAT mode and preference are the backend's decoded
+		// names (rat_name/pref1_name/pref2_name, manual §11.1.14) - not raw ints. "auto" on
+		// the band row is a separate, derived fact: whether the enabled set is the full
+		// capability, computed in bandSummary().
 		var bs = bandSummary(ri);
+		var pref = [ ri.pref1_name, ri.pref2_name ].filter(function(x) { return x; }).join(' > ');
 		var bandRows = [
-			[ _('Mode'), bs.haveAny ? (bs.auto ? _('auto (all supported bands)') : _('narrowed'))
-			                        : E('em', {}, [ '—' ]) ],
+			[ _('RAT mode'),  val(ri.rat_name) ],
+			[ _('Preferred'), pref ? pref : E('em', {}, [ '—' ]) ],
+			[ _('Band selection'), bs.haveAny ? (bs.auto ? _('auto (all supported bands)') : _('narrowed'))
+			                                  : E('em', {}, [ '—' ]) ],
 			[ _('Enabled bands'), bs.summary ? bs.summary : E('em', {}, [ '—' ]) ]
 		];
 		if (bs.haveAny && !bs.auto)
@@ -267,6 +280,44 @@ return view.extend({
 			L.resolveDefault(callCaInfo(), {}),
 			L.resolveDefault(callRadioInfo(), {})
 		]);
+	},
+
+	// Awaiting-confirm banner for a SIM slot switch (mirrors the Radio page). Shown only
+	// while a pending switch is unconfirmed; the Keep button persists it via sim_confirm.
+	bannerNode: function(rs) {
+		var self = this;
+		if (!rs || !(rs.awaiting_confirm || rs.state === 'confirm'))
+			return [];
+		return E('div', { 'class': 'alert-message warning' }, [
+			E('h4', {}, [ _('SIM switch awaiting confirmation') ]),
+			E('p', {}, [ rs.detail ? String(rs.detail)
+			                       : _('A SIM slot switch reached data but has not been made permanent.') ]),
+			E('p', {}, [ _('Do nothing and it rolls back to the previous SIM at the second reboot. Keep it only once you have confirmed data is on the account you expect (watch for roaming charges).') ]),
+			E('div', {}, [
+				E('button', { 'class': 'btn cbi-button-action important',
+					'click': ui.createHandlerFn(this, function() {
+						return callSimConfirm().then(function() {
+							ui.addNotification(null, E('p', _('SIM switch kept.')), 'info');
+							return self.refreshBanner();
+						});
+					}) }, [ _('Keep this SIM') ])
+			])
+		]);
+	},
+
+	refreshBanner: function() {
+		var self = this;
+		return L.resolveDefault(callRadioState(), null).then(function(rs) {
+			dom.content(self.bannerBox, self.bannerNode(rs));
+		});
+	},
+
+	setBannerPoll: function(secs) {
+		if (this.bannerPollFn)
+			poll.remove(this.bannerPollFn);
+		var self = this;
+		this.bannerPollFn = function() { return self.refreshBanner(); };
+		poll.add(this.bannerPollFn, secs);
 	},
 
 	refreshDetail: function() {
@@ -397,8 +448,12 @@ return view.extend({
 		this.detailContainer = E('div');
 		dom.content(this.detailContainer, this.renderDetail({}, {}));
 
+		// Empty until the banner poll finds a pending SIM confirmation.
+		this.bannerBox = E('div');
+
 		var content = E([], [
 			E('h2', {}, [ _('FM350 Cellular Modem') ]),
+			this.bannerBox,
 			E('div', { 'class': 'cbi-section' }, [
 				E('button', {
 					'class': 'btn cbi-button-action',
@@ -424,6 +479,11 @@ return view.extend({
 		// not stare at dashes for 30s.
 		this.setDetailPoll(DETAIL);
 		this.refreshDetail();
+
+		// Cheap SIM-confirm banner poll, plus an immediate check so a pending switch shows at
+		// once when the user opens the status page.
+		this.setBannerPoll(BANNER);
+		this.refreshBanner();
 
 		return content;
 	},
