@@ -10,7 +10,8 @@
 					"ca_info",
 					"radio_info",
 					"cells",
-					"radio_state"
+					"radio_state",
+					"ttl_get"
 				]
 			}
 		},
@@ -26,11 +27,14 @@
 					"sim_set",
 					"sim_confirm",
 					"cell_set",
-					"cell_unlock"
+					"cell_unlock",
+					"ttl_set"
 				]
 			},
 			"uci": [
-				"network"
+				"network",
+				"firewall",
+				"h5000m-ttl"
 			]
 		}
 	}

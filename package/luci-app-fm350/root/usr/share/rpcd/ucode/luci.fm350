@@ -957,6 +957,56 @@ const methods = {
 		}
 	},
 
+	// TTL/hop-limit normalisation. The mechanism lives in h5000m-ttl (a separate package);
+	// this only reads its UCI and runs the apply helper, so the nft generation has ONE owner.
+	ttl_get: {
+		call: function() {
+			const g = function(o, d) {
+				const v = trim(run(`uci -q get h5000m-ttl.settings.${o} 2>/dev/null`) ?? '');
+				return v != '' ? v : d;
+			};
+			// Reported so the UI can state the real consequence rather than a generic warning:
+			// offloaded flows never traverse postrouting, so with offloading on only a flow's
+			// first packets get rewritten - a mix of 64 and 63 fingerprints tethering just as
+			// well as no rewrite at all.
+			const off = trim(run("uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null") ?? '');
+			const offhw = trim(run("uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null") ?? '');
+			return {
+				installed: !!stat('/usr/libexec/h5000m-ttl-apply'),
+				enabled: g('enabled', '0') == '1',
+				value: +g('value', '64'),
+				interface: g('interface', 'cellular'),
+				manage_offload: g('manage_offload', '1') == '1',
+				flow_offloading: off == '1',
+				flow_offloading_hw: offhw == '1',
+				// True when the rule is actually in the live ruleset, not merely configured -
+				// `nft list` showing a rule is the check people wrongly trust, so report the
+				// real thing and let the view say counters do not prove the wire value.
+				active: !!match(run("nft list chain inet fw4 mangle_postrouting 2>/dev/null") ?? '', /ttl set/)
+			};
+		}
+	},
+
+	ttl_set: {
+		args: { enabled: 0, value: 0, manage_offload: 0 },
+		call: function(req) {
+			const v = req.args?.value ?? 64;
+			if (v < 1 || v > 255)
+				return { ok: false, error: 'value must be 1-255' };
+			if (!stat('/usr/libexec/h5000m-ttl-apply'))
+				return { ok: false, error: 'h5000m-ttl is not installed' };
+
+			run(`uci -q set h5000m-ttl.settings.enabled=${req.args?.enabled ? 1 : 0}`);
+			run(`uci -q set h5000m-ttl.settings.value=${+v}`);
+			run(`uci -q set h5000m-ttl.settings.manage_offload=${req.args?.manage_offload ? 1 : 0}`);
+			run('uci -q commit h5000m-ttl');
+			// Synchronous and quick - this is nft generation plus one fw4 reload, not an AT
+			// transaction, so it does not need the guard's apply/verify machinery.
+			const out = run('/usr/libexec/h5000m-ttl-apply 2>&1') ?? '';
+			return { ok: true, output: trim(out) };
+		}
+	},
+
 	sms_list: {
 		call: function() {
 			// sms_tool decodes PDU and UCS2, but it does NOT reassemble concatenated SMS -
