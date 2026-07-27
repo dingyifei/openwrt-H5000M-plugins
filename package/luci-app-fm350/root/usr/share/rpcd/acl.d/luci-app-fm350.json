@@ -1,0 +1,15 @@
+{
+	"luci-app-fm350": {
+		"description": "Grant access to FM350 modem status, SMS and recovery actions",
+		"read": {
+			"ubus": {
+				"luci.fm350": [ "status", "sms_list", "reset_status" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.fm350": [ "sms_send", "sms_delete", "reconnect", "reset_modem" ]
+			}
+		}
+	}
+}

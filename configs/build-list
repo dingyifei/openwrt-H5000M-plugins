@@ -12,3 +12,4 @@ h5000m-travelmate-defaults
 h5000m-tailscale-defaults
 h5000m-mwan3-policy
 luci-proto-fm350
+luci-app-fm350

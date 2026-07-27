@@ -1,0 +1,368 @@
+#!/usr/bin/ucode
+// rpcd backend for luci-app-fm350: FM350 status, SMS and recovery actions.
+//
+// LOCATION MATTERS: this belongs in /usr/share/rpcd/ucode/, NOT /usr/libexec/rpcd/. The
+// latter is rpcd's *exec* plugin protocol - it forks the file with list/call argv and
+// parses stdout - and every file there in luci master is a /bin/sh script. ucode scripts
+// are loaded into a VM instead, and must return { '<ubus object>': methods } at top level.
+//
+// PORT DISCIPLINE: this NEVER opens a serial device. Every AT exchange goes through `atq`
+// and every SMS through `h5000m-sms`, both of which take the shared lock keyed on the
+// stable USB topology path. A page that opened the port directly would desynchronise the
+// dialer - the exact reason QModem was rejected for this device.
+//
+// PRIORITY: AT_PRIO=1, the lowest tier. A status page refreshing itself must never delay
+// the dialer keeping the link up, and ATQ_WAIT is short so contention surfaces as
+// "modem busy" rather than a page that hangs for half a minute.
+
+'use strict';
+
+import { popen, readfile } from 'fs';
+import { connect } from 'ubus';
+
+const IFACE = 'cellular';
+const ATQ_PRIO = 'AT_PRIO=1 ATQ_WAIT=3';
+
+// Cached across calls because rpcd keeps the VM loaded: N browser tabs then cost ONE AT
+// transaction per interval instead of N. Without this, two open tabs in live mode would
+// double the load on the scarcest resource on the device.
+let cache = { at: 0, data: null };
+
+function shq(s) {
+	return "'" + replace(s ?? '', "'", "'\\''") + "'";
+}
+
+function run(cmd) {
+	const fd = popen(cmd, 'r');
+	if (!fd)
+		return null;
+	const out = fd.read('all');
+	fd.close();
+	return out;
+}
+
+// Parse the @@CMD / body / @@RC stream that `atq -b` emits. Returning a map keyed by
+// command lets callers ask for what they want without caring about ordering.
+function atq_batch(cmds) {
+	let args = '';
+	for (let c in cmds)
+		args += ' ' + shq(c);
+
+	const out = run(`${ATQ_PRIO} /usr/sbin/atq -b${args} 2>/dev/null`);
+	const res = {};
+	if (!out)
+		return res;
+
+	let cur = null;
+	for (let line in split(out, '\n')) {
+		if (substr(line, 0, 6) == '@@CMD ') {
+			cur = substr(line, 6);
+			res[cur] = { lines: [], rc: -1 };
+		}
+		else if (substr(line, 0, 5) == '@@RC ') {
+			if (cur != null)
+				res[cur].rc = +substr(line, 5);
+			cur = null;
+		}
+		else if (cur != null && trim(line) != '') {
+			push(res[cur].lines, trim(line));
+		}
+	}
+	return res;
+}
+
+function first_line(res, cmd, prefix) {
+	const e = res?.[cmd];
+	if (!e || e.rc != 0)
+		return null;
+	for (let l in e.lines)
+		if (index(l, prefix) == 0)
+			return l;
+	return null;
+}
+
+// +CESQ fields, per 3GPP TS 27.007:
+//   0 rxlev  1 ber  2 rscp  3 ecno  4 rsrq  5 rsrp  6 ssrsrp  7 ssrsrq  8 sssinr
+//
+// WHICH FIELDS ARE LIVE DEPENDS ON THE RADIO ACCESS TECHNOLOGY, and 255 means "not
+// available". Both shapes were observed on this unit within a day:
+//   NR : +CESQ: 99,99,255,255,255,255,83,73,77    <- the NR triple
+//   LTE: +CESQ: 27,99,255,255,16,44,255,255,255   <- the LTE pair
+// A page hard-coded to one of them shows nonsense on the other, so decide from the value
+// rather than assuming, and report unavailable as null so the view can print a dash.
+function parse_cesq(line) {
+	if (!line)
+		return {};
+	const f = split(replace(line, /^\+CESQ:\s*/, ''), ',');
+	const v = [];
+	for (let x in f)
+		push(v, +trim(x));
+
+	const out = {};
+	// NR first: when the modem is on 5G the LTE pair is 255 and vice versa, so whichever
+	// set is populated is the one that describes the current serving cell.
+	if (length(v) > 8 && v[6] != 255) {
+		out.rat_hint = 'NR';
+		out.rsrp = v[6] - 156;
+		out.rsrq = (v[7] / 2) - 43;
+		out.sinr = (v[8] / 2) - 23;
+	}
+	else if (length(v) > 5 && v[5] != 255) {
+		out.rat_hint = 'LTE';
+		out.rsrp = v[5] - 140;
+		out.rsrq = (v[4] / 2) - 19.5;
+	}
+	return out;
+}
+
+// AT+COPS? -> +COPS: <mode>,<format>,"<oper>",<AcT>
+// AcT values seen here: 7 = E-UTRAN (LTE), 11 = NR connected to a 5G core.
+// A function rather than an object literal: ucode rejects bare numeric keys ("Expecting
+// label"), and quoting them would then need the lookup to coerce int->string.
+function act_name(a) {
+	switch (a) {
+	case 0:  return 'GSM';
+	case 2:  return 'UTRAN';
+	case 3:  return 'GSM/EGPRS';
+	case 4:  return 'UTRAN/HSDPA';
+	case 5:  return 'UTRAN/HSUPA';
+	case 6:  return 'UTRAN/HSPA';
+	case 7:  return 'LTE';
+	case 11: return 'NR (5GC)';
+	case 12: return 'NG-RAN';
+	case 13: return 'LTE/NR';
+	default: return `AcT ${a}`;
+	}
+}
+
+function parse_cops(line) {
+	if (!line)
+		return {};
+	// No non-capturing group here: ucode's regex engine rejects (?:...) with "Repetition
+	// not preceded by valid expression". The AcT field is captured as a possibly-empty
+	// run of digits instead, which costs nothing and works.
+	const m = match(line, /\+COPS:\s*\d+,\s*\d+,\s*"([^"]*)",?\s*([0-9]*)/);
+	if (!m)
+		return {};
+	const act = (m[2] != null && m[2] != '') ? +m[2] : null;
+	return {
+		operator: m[1],
+		act: act,
+		act_name: act != null ? act_name(act) : null
+	};
+}
+
+function reg_name(r) {
+	switch (r) {
+	case 0:  return 'not registered';
+	case 1:  return 'registered (home)';
+	case 2:  return 'searching';
+	case 3:  return 'denied';
+	case 4:  return 'unknown';
+	case 5:  return 'registered (roaming)';
+	default: return `state ${r}`;
+	}
+}
+
+function parse_cereg(line) {
+	const m = line ? match(line, /\+CEREG:\s*\d+,\s*(\d+)/) : null;
+	if (!m)
+		return {};
+	return { reg: +m[1], reg_name: reg_name(+m[1]) };
+}
+
+function active_aid(res) {
+	const e = res?.['AT+CGACT?'];
+	if (!e || e.rc != 0)
+		return null;
+	for (let l in e.lines) {
+		const m = match(l, /\+CGACT:\s*(\d+),\s*1/);
+		if (m)
+			return +m[1];
+	}
+	return null;
+}
+
+// Interface state comes from ubus and sysfs, never AT: it is free, always current, and
+// costs no share of the single serial port.
+function iface_state() {
+	const out = { up: false, device: null, ipv4: null, gateway: null, dns: [] };
+	try {
+		const bus = connect();
+		const st = bus.call(`network.interface.${IFACE}`, 'status');
+		bus.disconnect();
+		if (!st)
+			return out;
+		out.up = st.up ?? false;
+		out.device = st.l3_device;
+		out.dns = st['dns-server'] ?? [];
+		const a = st['ipv4-address']?.[0];
+		if (a)
+			out.ipv4 = `${a.address}/${a.mask}`;
+		for (let r in (st.route ?? []))
+			if (r.target == '0.0.0.0' && r.mask == 0)
+				out.gateway = r.nexthop;
+	} catch (e) { }
+	return out;
+}
+
+function counters(dev) {
+	if (!dev)
+		return {};
+	const rx = readfile(`/sys/class/net/${dev}/statistics/rx_packets`);
+	const tx = readfile(`/sys/class/net/${dev}/statistics/tx_packets`);
+	return { rx_packets: rx ? +trim(rx) : null, tx_packets: tx ? +trim(tx) : null };
+}
+
+function collect_status() {
+	const res = atq_batch([
+		'AT+CESQ', 'AT+COPS?', 'AT+CEREG?', 'AT+CGACT?', 'AT+CGMM'
+	]);
+
+	// Every AT command failing means the port is held or the modem is away. Say so
+	// explicitly rather than rendering a page full of blanks that looks like "no signal".
+	let ok = false;
+	for (let k in res)
+		if (res[k].rc == 0)
+			ok = true;
+
+	const st = iface_state();
+	const aid = active_aid(res);
+
+	let apn = null, dns = [];
+	if (aid != null) {
+		const rdp = atq_batch([`AT+CGCONTRDP=${aid}`]);
+		const l = first_line(rdp, `AT+CGCONTRDP=${aid}`, '+CGCONTRDP:');
+		if (l) {
+			const f = split(l, ',');
+			if (length(f) > 2)
+				apn = replace(trim(f[2]), /"/g, '');
+			for (let i = 5; i < 7 && i < length(f); i++) {
+				const d = replace(trim(f[i]), /"/g, '');
+				// CGCONTRDP renders IPv6 as sixteen dotted octets; keep the four-octet
+				// form so a v6 address is not shown as though it were v4.
+				if (d != '' && length(split(d, '.')) == 4)
+					push(dns, d);
+			}
+		}
+	}
+
+	return {
+		modem_reachable: ok,
+		model: first_line(res, 'AT+CGMM', '') ,
+		...parse_cesq(first_line(res, 'AT+CESQ', '+CESQ:')),
+		...parse_cops(first_line(res, 'AT+COPS?', '+COPS')),
+		...parse_cereg(first_line(res, 'AT+CEREG?', '+CEREG:')),
+		aid: aid,
+		apn: apn,
+		dns: length(dns) ? dns : st.dns,
+		interface: st,
+		...counters(st.device)
+	};
+}
+
+const methods = {
+	// ttl lets the view ask for fresher data in live mode without a second code path.
+	status: {
+		args: { ttl: 0 },
+		call: function(req) {
+			const ttl = req.args?.ttl ?? 15;
+			const now = time();
+			if (cache.data && (now - cache.at) < ttl)
+				return { ...cache.data, cached: true, age: now - cache.at };
+			cache.data = collect_status();
+			cache.at = now;
+			return { ...cache.data, cached: false, age: 0 };
+		}
+	},
+
+	sms_list: {
+		call: function() {
+			// sms_tool already decodes PDU, UCS2 and multipart, so nothing here parses
+			// PDUs. -j gives us JSON directly.
+			const out = run('/usr/sbin/h5000m-sms -j recv 2>/dev/null');
+			let msgs = [];
+			try { msgs = json(out)?.msg ?? []; } catch (e) { msgs = []; }
+
+			// Storage counters, so a filling store is visible BEFORE it starts silently
+			// rejecting messages. There is no read/unread flag anywhere in this data.
+			const stat = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
+			const m = match(stat, /used:\s*(\d+),\s*total:\s*(\d+)/);
+			return {
+				messages: msgs,
+				used: m ? +m[1] : null,
+				total: m ? +m[2] : null
+			};
+		}
+	},
+
+	sms_send: {
+		// args is a TYPE-EXEMPLAR map: the value sets the blobmsg type, and a method
+		// declaring no args accepts no parameters at all - the payload would be dropped
+		// silently. These names must match rpc.declare's params: exactly.
+		args: { number: 'string', text: 'string' },
+		call: function(req) {
+			const num = req.args?.number ?? '';
+			const txt = req.args?.text ?? '';
+			if (num == '' || txt == '')
+				return { ok: false, error: 'number and text are both required' };
+			const out = run(`/usr/sbin/h5000m-sms send ${shq(num)} ${shq(txt)} 2>&1`);
+			// sms_tool reports failure in prose; treat any mention of error as failure
+			// rather than trusting an exit code we cannot see through popen.
+			const bad = match(out ?? '', /[Ee]rror|ERROR|failed/);
+			return { ok: !bad, output: trim(out ?? '') };
+		}
+	},
+
+	sms_delete: {
+		args: { index: 0 },
+		call: function(req) {
+			const idx = req.args?.index;
+			if (idx == null)
+				return { ok: false, error: 'index is required' };
+			const out = run(`/usr/sbin/h5000m-sms delete ${shq('' + idx)} 2>&1`);
+			return { ok: true, output: trim(out ?? '') };
+		}
+	},
+
+	reconnect: {
+		call: function() {
+			run(`/sbin/ifdown ${IFACE} 2>/dev/null; /sbin/ifup ${IFACE} 2>/dev/null`);
+			cache.at = 0;
+			return { ok: true };
+		}
+	},
+
+	// The USB-level reset that recovers a half-dead endpoint. unbind/bind does NOT fix
+	// that state and can make it worse; toggling `authorized` does. Runs detached because
+	// it takes ~70s, far longer than an rpcd call may block.
+	reset_modem: {
+		call: function() {
+			const usb = trim(run("sed -n 's/^MODEM_USBPATH=//p' /var/run/h5000m-modem.state 2>/dev/null") ?? '');
+			const path = replace(usb, /'/g, '');
+			if (path == '')
+				return { ok: false, error: 'modem USB path unknown - is the modem enumerated?' };
+			run(`(echo 0 > /sys/bus/usb/devices/${path}/authorized; sleep 8; ` +
+			    `echo 1 > /sys/bus/usb/devices/${path}/authorized) >/dev/null 2>&1 &`);
+			cache.at = 0;
+			return { ok: true, usb_path: path, note: 'reset started; allow ~70s' };
+		}
+	},
+
+	// Reports whether the AT endpoint is genuinely usable again. Deliberately checks with
+	// stty rather than `ls`: the tty nodes reappear SECONDS BEFORE the endpoint works, and
+	// checking for the node made two earlier recovery attempts look successful when they
+	// were not.
+	reset_status: {
+		call: function() {
+			const dev = trim(run("sed -n 's/^MODEM_AT_B=//p' /var/run/h5000m-modem.state 2>/dev/null") ?? '');
+			const path = replace(dev, /'/g, '');
+			if (path == '')
+				return { ready: false, reason: 'no modem state yet' };
+			const out = run(`stty -F ${shq(path)} -a 2>&1 | head -1`) ?? '';
+			return { ready: !!match(out, /speed/), detail: trim(out) };
+		}
+	}
+};
+
+return { 'luci.fm350': methods };

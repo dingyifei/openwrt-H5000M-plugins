@@ -29,6 +29,9 @@ config logging 'logging'
 	option modem_atd ''
 	option sms ''
 	option esim ''
+	# The LuCI backend. It logs through the same library as everything else - a new
+	# component must not be the one thing that bypasses it.
+	option ui ''
 	# Identifier masking. AT traffic carries IMSI, ICCID, EID, phone numbers and whole SMS
 	# bodies; syslog can be forwarded off-box. Applies at EVERY level, not just trace -
 	# an ICCID in a warning is exactly as sensitive as one in a trace. On by default;

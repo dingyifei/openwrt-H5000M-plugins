@@ -116,6 +116,44 @@ else
 	ok "no anonymous wireless sections created"
 fi
 
+echo "== LuCI rpcd backends: no serial access, lowest AT priority =="
+# The single AT port is shared with the dialer that keeps the link up. A web backend that
+# opened a tty directly would desynchronise it - the exact reason QModem was rejected - and
+# one that polled at default priority could delay a reconnect.
+for f in $(find "$PKGDIR" -type f -path '*/rpcd/ucode/*' | sort); do
+	if code_of "$f" | grep -qE '/dev/tty'; then
+		bad "$(basename "$f") references a tty directly"
+	else
+		ok "$(basename "$f") takes no direct serial access"
+	fi
+	if code_of "$f" | grep -q 'AT_PRIO=1'; then
+		ok "$(basename "$f") polls at the lowest AT priority"
+	else
+		bad "$(basename "$f") does not set AT_PRIO=1"
+	fi
+done
+
+echo "== ucode rpcd backends must live in /usr/share/rpcd/ucode =="
+# /usr/libexec/rpcd is the EXEC plugin protocol (rpcd forks the file and parses stdout).
+# A ucode script placed there is never loaded, and the only symptom is a missing menu entry.
+if find "$PKGDIR" -type d -path '*/libexec/rpcd*' | grep -q .; then
+	bad "a package ships into /usr/libexec/rpcd (wrong dir for ucode backends)"
+else
+	ok "no ucode backend in the exec-plugin directory"
+fi
+
+echo "== LuCI app packages must reload rpcd in postinst =="
+# Without it rpcd never loads the new backend or learns the new ACL group: the menu entry
+# vanishes or every page reports "Access denied" until a reboot. luci.mk generates this
+# automatically and these packages deliberately do not use luci.mk.
+for mk in $(find "$PKGDIR" -maxdepth 2 -name Makefile -path '*luci-app-*' | sort); do
+	if grep -q 'rpcd reload' "$mk"; then
+		ok "$(basename "$(dirname "$mk")") reloads rpcd in postinst"
+	else
+		bad "$(basename "$(dirname "$mk")") has no rpcd reload in postinst"
+	fi
+done
+
 echo
 echo "checks=${checks} failures=${fails}"
 [ "$fails" -eq 0 ] || exit 1
