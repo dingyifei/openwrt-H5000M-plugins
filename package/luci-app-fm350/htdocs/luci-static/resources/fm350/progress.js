@@ -223,7 +223,17 @@ Progress.prototype.unlock = function() {
 	return ui.showModal(_('Unlock the cell?'), body);
 };
 
-return {
+// ⚠️ MUST be L.Class.extend(...), NOT a plain object literal.
+//
+// LuCI's require/compileClass treats a module's RETURN VALUE as a class and instantiates it.
+// Returning `{ create: ..., outageWarning: ... }` makes every page that requires this module
+// die with:
+//     TypeError: "fm350.progress" factory yields invalid constructor
+// and `node --check` passes it, because it is a contract violation and not a syntax error.
+// This is the SECOND time this exact trap has been hit here - protocol/fm350.js shipped
+// without its `return network.registerProtocol(...)` for the same reason. The invariant suite
+// now covers every module under luci-static/resources, not just protocol handlers.
+return L.Class.extend({
 	create: function(node) { return new Progress(node); },
 	outageWarning: outageWarning
-};
+});

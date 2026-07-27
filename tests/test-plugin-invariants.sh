@@ -101,6 +101,29 @@ for f in $(find "$PKGDIR" -type f -path '*/resources/protocol/*.js' | sort); do
 	fi
 done
 
+echo "== every LuCI resource module must RETURN a class =="
+# The generalisation of the check above, added after the SAME trap was hit a second time.
+# LuCI's require/compileClass treats a module's return value as a class and INSTANTIATES it, so
+# a module ending in a plain object literal dies at load with
+#   TypeError: "fm350.progress" factory yields invalid constructor
+# and takes every page that requires it down with it. `node --check` passes either way.
+#
+# First occurrence: protocol/fm350.js with no `return` at all. Second: resources/fm350/progress.js
+# returning `{ create: ..., outageWarning: ... }`. Both shipped. The valid shapes are a
+# `.extend(` call - view.extend, L.Class.extend, form.Value.extend, network.registerProtocol -
+# so the rule is simply: the module's `return` must hand back something built with `.extend(`
+# or registerProtocol, never a bare object.
+_mod=0
+for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); do
+	# Views and modules both qualify; anything under resources/ is require-able.
+	if grep -qE '^[[:space:]]*return[[:space:]]+([A-Za-z_$.]+\.extend\(|network\.registerProtocol)' "$f"; then
+		continue
+	fi
+	bad "$(basename "$f") does not return a class (LuCI will call it as a constructor)"
+	_mod=1
+done
+[ "$_mod" -eq 0 ] && ok "all LuCI resource modules return a class"
+
 echo "== uci-defaults must not create anonymous wireless sections =="
 # `uci add wireless wifi-iface` yields an anonymous section, which is precisely what LuCI's
 # wireless-migration prompt exists to rewrite - and it restarts the network to do it. Name
