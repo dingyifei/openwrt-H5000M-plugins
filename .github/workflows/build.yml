@@ -29,6 +29,7 @@ jobs:
         run: |
           bash tests/test-check-secrets.sh
           bash tests/test-plugin-signing-key.sh
+          sh tests/test-log-library.sh
 
       - name: Secret scan
         run: ./scripts/check-secrets.sh

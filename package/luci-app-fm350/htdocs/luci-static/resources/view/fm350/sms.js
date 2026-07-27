@@ -14,7 +14,7 @@ var callList   = rpc.declare({ object: 'luci.fm350', method: 'sms_list', expect:
 var callSend   = rpc.declare({ object: 'luci.fm350', method: 'sms_send',
                                params: [ 'number', 'text' ], expect: { '': {} } });
 var callDelete = rpc.declare({ object: 'luci.fm350', method: 'sms_delete',
-                               params: [ 'index' ], expect: { '': {} } });
+                               params: [ 'index', 'indexes' ], expect: { '': {} } });
 
 return view.extend({
 	load: function() {
@@ -38,14 +38,30 @@ return view.extend({
 				? E('em', { 'style': 'color:#a00' }, [ _('(could not decode: %s)').format(m.error) ])
 				: E('span', { 'style': 'white-space:pre-wrap' }, [ m.content || '' ]);
 
+			// A multipart message is reassembled by the backend, but say so - the store
+			// counter reflects SEGMENTS, so "6 of 90 used" for one visible message is
+			// correct and would otherwise look like a bug.
+			var parts = null;
+			if (m.total > 1) {
+				parts = m.complete
+					? E('span', { 'class': 'cbi-value-description' },
+					    [ ' ' + _('(joined from %d parts)').format(m.total) ])
+					// Incomplete groups are rendered, not hidden: a missing segment is
+					// precisely when the reader needs to know the text is truncated.
+					: E('strong', { 'style': 'color:#a00' },
+					    [ ' ' + _('(incomplete: %d of %d parts)').format(m.parts, m.total) ]);
+			}
+
+			var idxList = (m.indexes && m.indexes.length) ? m.indexes.join(',') : String(m.index);
+
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td left', 'width': '18%' }, [ m.sender || E('em', {}, [ '—' ]) ]),
 				E('td', { 'class': 'td left', 'width': '22%' }, [ m.timestamp || E('em', {}, [ '—' ]) ]),
-				E('td', { 'class': 'td left' }, [ body ]),
+				E('td', { 'class': 'td left' }, [ body, parts || '' ]),
 				E('td', { 'class': 'td right', 'width': '8%' }, [
 					E('button', {
 						'class': 'btn cbi-button-remove',
-						'click': ui.createHandlerFn(self, 'handleDelete', m.index)
+						'click': ui.createHandlerFn(self, 'handleDelete', idxList, m.total || 1)
 					}, [ _('Delete') ])
 				])
 			]);
@@ -87,17 +103,29 @@ return view.extend({
 		});
 	},
 
-	handleDelete: function(index, ev) {
+	// `indexes` is the comma-separated list of every storage slot this message occupies.
+	// Deleting only the slot that was clicked would orphan the other segments, and a
+	// partially-deleted multipart message can never be reassembled.
+	handleDelete: function(indexes, parts, ev) {
 		var self = this;
+		var note = (parts > 1)
+			? _('This message spans %d storage slots; all of them are removed.').format(parts)
+			: _('It is removed from the modem store and cannot be recovered.');
+
 		return ui.showModal(_('Delete this message?'), [
-			E('p', {}, [ _('It is removed from the modem store and cannot be recovered.') ]),
+			E('p', {}, [ note ]),
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
 				E('button', {
 					'class': 'btn cbi-button-negative important',
 					'click': ui.createHandlerFn(this, function() {
-						return callDelete(index).then(function() {
+						return callDelete(null, indexes).then(function(res) {
 							ui.hideModal();
+							if (res && res.ok === false)
+								ui.addNotification(null, E('p', {}, [
+									_('Some segments could not be deleted: %s')
+										.format((res.failed || []).join(', '))
+								]), 'danger');
 							return self.refresh();
 						});
 					})

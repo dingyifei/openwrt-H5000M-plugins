@@ -7,6 +7,9 @@ bash tests/test-plugin-invariants.sh
 sh   tests/test-log-library.sh
 ```
 
+One further suite needs a ucode interpreter and therefore runs **on the router**, not on the
+host — see `test-sms-grouping.uc` below.
+
 Both are **negative-controlled** — every assertion was checked by injecting the violation
 and confirming the suite fails. That habit exists because this repo has already shipped a
 test that passed vacuously: it compared two empty files, because `uci show` with multiple
@@ -42,6 +45,33 @@ The redaction assertions grep for the **actual** IMSI, EID, ICCID and PDU values
 than for the mask — a privacy control has to be proven absent, not observed to look right.
 The suite also asserts short values (`+CESQ: 99,99,...`, `OK`) are *not* mangled, since
 over-redaction would make the logs useless.
+
+## `test-sms-grouping.uc` — 21 unit tests (runs on the router)
+
+Concatenated-SMS reassembly, exercised against the shapes that actually occurred:
+
+- a six-part Chinese message whose **storage order is not part order** — measured on this unit
+  as parts 6,3,2,4,5,1 in slots 1–6. Sorting by slot yields `FCBDEA` instead of `ABCDEF`;
+- two messages from the same sender with the **same timestamp** and different concat
+  references, which is why the grouping key is `(sender, reference, total)`. Keying on
+  timestamp instead — what `luci-app-sms-tool-js` does — fails 8 assertions here, splitting
+  the real message into four fragments *and* merging two unrelated ones into `AXBY`;
+- an incomplete group, which must still render rather than disappear;
+- a standalone message, which carries no concat fields at all.
+
+It loads the **real** backend and swaps its export line, rather than duplicating the function —
+a copy would drift and then pass while the shipped code was broken.
+
+```sh
+scp -r package tests root@192.168.10.1:/tmp/t/
+ssh root@192.168.10.1 'cd /tmp/t && ucode tests/test-sms-grouping.uc /tmp/t'
+```
+
+It is **not** in host CI, and that is deliberate rather than an oversight: the backend does
+`import ... from 'ubus'` so compiling it needs libubus, and there is no `ucode` package in
+Ubuntu 24.04 (checked — `packages.ubuntu.com/noble/ucode` is a 404). Making it "skip" on the
+host was rejected because a skipped test reads exactly like a passing one, which is the failure
+mode this repo has already been bitten by.
 
 ## Still worth writing
 
