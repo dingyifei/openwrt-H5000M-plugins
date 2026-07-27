@@ -3,6 +3,7 @@
 'require rpc';
 'require dom';
 'require ui';
+'require fm350.progress';
 
 // FM350 cell survey page.
 //
@@ -26,6 +27,23 @@ var callCells = rpc.declare({
 	params: [ 'refresh' ],
 	expect: { '': {} }
 });
+
+// radio_info carries the current cell-lock state (cell_locked/cell_arfcn/cell_pci). We read it
+// once per (re)load to highlight the locked row and to seed the shared banner's Unlock control -
+// never on a poll, so opening this page costs one cached AT batch, not a standing modem drain.
+var callRadioInfo = rpc.declare({ object: 'luci.fm350', method: 'radio_info', expect: { '': {} } });
+
+// A cell is lockable only when it is an LTE (E-UTRAN) cell. cell.rat here is the GTCCINFO code
+// (4=LTE, 9=NR, 2=UMTS) which is a DIFFERENT numbering from cell_caps.rats (EMMCHLCK 0/2/7), so
+// they must not be compared directly. cell_set is an E-UTRAN lock (EARFCN+PCI, lte_only) with no
+// RAT parameter, so LTE is the only RAT it can actually pin.
+function lockReason(rat) {
+	if (rat === 9)
+		return _('NR cell locking is not supported by this firmware');
+	if (rat === 2)
+		return _('Cell locking applies to LTE cells only on this modem');
+	return _('This cell type cannot be locked');
+}
 
 // Same dash semantics as the status page: null/undefined/'' is a dash, never "undefined" or
 // a misleading number. Neighbour rows legitimately omit band/bandwidth/SINR and null the
@@ -54,6 +72,7 @@ return view.extend({
 	// Build just the results block (alerts + table + notes); render() wraps it with the
 	// static heading and Scan button so a re-scan only swaps this subtree.
 	renderResults: function(r) {
+		var self = this;
 		r = r || {};
 		var out = [];
 
@@ -76,17 +95,24 @@ return view.extend({
 				E('th', { 'class': 'th' }, [ _('Bandwidth') ]),
 				E('th', { 'class': 'th' }, [ 'RSRP' ]),
 				E('th', { 'class': 'th' }, [ 'RSRQ' ]),
-				E('th', { 'class': 'th' }, [ 'SINR' ])
+				E('th', { 'class': 'th' }, [ 'SINR' ]),
+				E('th', { 'class': 'th' }, [ _('Lock') ])
 			]);
+
+			var lk = self.lockInfo || {};
 
 			// Rows arrive serving-first then strongest-RSRP-first; the backend already ordered
 			// them, so we render in place and never re-sort.
 			var body = cells.map(function(c) {
 				var serving = !!c.serving;
+				// This row IS the locked cell when EARFCN and PCI both match what EMMCHLCK reports.
+				var lockedRow = lk.locked && c.arfcn === lk.arfcn && c.pci === lk.pci;
 				return E('tr', {
 					'class': 'tr',
-					// Tint the serving row so it reads at a glance without a legend.
-					'style': serving ? 'background-color:rgba(0,136,0,0.08)' : ''
+					// Locked row tinted blue (overrides the serving green); serving tinted green.
+					// Both are readable at a glance without a legend.
+					'style': lockedRow ? 'background-color:rgba(0,80,200,0.10)'
+					       : serving   ? 'background-color:rgba(0,136,0,0.08)' : ''
 				}, [
 					E('td', { 'class': 'td' }, [ serving ? E('strong', {}, [ _('Serving') ]) : _('neighbour') ]),
 					E('td', { 'class': 'td' }, [ val(c.rat_name) ]),
@@ -96,7 +122,8 @@ return view.extend({
 					E('td', { 'class': 'td' }, [ val(c.bandwidth) ]),
 					E('td', { 'class': 'td' }, [ num(c.rsrp, 'dBm', 0) ]),
 					E('td', { 'class': 'td' }, [ num(c.rsrq, 'dB', 0) ]),
-					E('td', { 'class': 'td' }, [ num(c.snr, 'dB', 0) ])
+					E('td', { 'class': 'td' }, [ num(c.snr, 'dB', 0) ]),
+					E('td', { 'class': 'td' }, [ self.lockCell(c, serving, lockedRow) ])
 				]);
 			});
 
@@ -115,6 +142,51 @@ return view.extend({
 		out.push(E('p', { 'class': 'cbi-value-description' }, [ notes.join(' · ') ]));
 
 		return E([], out);
+	},
+
+	// The per-row Lock cell. LTE rows get a live button (labelled "Pin to current cell" on the
+	// serving row, the safest and most common intent); the row that is already locked shows a
+	// bold "Locked" instead, with Unlock offered in the shared banner above. Non-LTE rows show a
+	// DISABLED button with the reason beside it — a missing button reads as a bug, a disabled one
+	// with its reason teaches the limit.
+	lockCell: function(c, serving, lockedRow) {
+		if (lockedRow)
+			return E('strong', {}, [ _('Locked') ]);
+		if (c.rat === 4)
+			return E('button', {
+				'class': 'btn cbi-button-action',
+				'click': ui.createHandlerFn(this, 'handleLock', c.arfcn, c.pci, serving)
+			}, [ serving ? _('Pin to current cell') : _('Lock') ]);
+		return E('span', {}, [
+			E('button', { 'class': 'btn', 'disabled': 'disabled' }, [ _('Lock') ]), ' ',
+			E('span', { 'class': 'cbi-value-description' }, [ lockReason(c.rat) ])
+		]);
+	},
+
+	// The confirm modal, the outage warning and the lte_only/persist options all live in the
+	// shared progress controller, so Cells and Radio drive the identical lock UX.
+	handleLock: function(arfcn, pci, serving) {
+		return this.progress.lock(arfcn, pci, { serving: serving });
+	},
+
+	// Re-read cells (non-forcing) and the lock state, then repaint. Used as the progress
+	// controller's onSettle so a lock/unlock started here updates the highlight when it lands.
+	reload: function() {
+		var self = this;
+		return Promise.all([
+			L.resolveDefault(callCells(0), {}),
+			L.resolveDefault(callRadioInfo(), {})
+		]).then(function(res) {
+			self.setLockInfo(res[1]);
+			self.progress.setLock(res[1]);
+			dom.content(self.container, self.renderResults(res[0]));
+		});
+	},
+
+	setLockInfo: function(ri) {
+		this.lockInfo = (ri && ri.cell_locked)
+			? { locked: true, arfcn: ri.cell_arfcn, pci: ri.cell_pci }
+			: { locked: false };
 	},
 
 	// --- async scan handling ---------------------------------------------------------
@@ -148,13 +220,29 @@ return view.extend({
 	// --- view plumbing ---------------------------------------------------------------
 
 	// Initial load reads the last-known survey WITHOUT forcing (refresh=0), so opening the
-	// page is cheap and never disturbs the dialer; the user forces a scan explicitly.
+	// page is cheap and never disturbs the dialer; the user forces a scan explicitly. radio_info
+	// rides alongside for the current lock state.
 	load: function() {
-		return L.resolveDefault(callCells(0), {});
+		return Promise.all([
+			L.resolveDefault(callCells(0), {}),
+			L.resolveDefault(callRadioInfo(), {})
+		]);
 	},
 
-	render: function(r) {
+	render: function(res) {
 		var self = this;
+		var r = res[0] || {};
+		this.setLockInfo(res[1] || {});
+
+		// Shared apply-progress + lock banner. Polls radio_state (no AT) so a lock started here
+		// stays visible after navigating away, and it carries the Unlock control so unlocking
+		// never depends on this cell list being rendered. onSettle repaints the highlight once an
+		// apply lands.
+		this.bannerBox = E('div');
+		this.progress = progress.create(this.bannerBox);
+		this.progress.setLock(res[1] || {});
+		this.progress.onSettle = L.bind(this.reload, this);
+
 		this.container = E('div');
 		dom.content(this.container, this.renderResults(r));
 
@@ -163,11 +251,14 @@ return view.extend({
 		if (r && r.pending)
 			this.chase(0);
 
+		this.progress.attach();
+
 		return E([], [
 			E('h2', {}, [ _('FM350 Cells') ]),
+			this.bannerBox,
 			E('div', { 'class': 'cbi-section' }, [
 				E('p', { 'class': 'cbi-value-description' }, [
-					_('The serving cell and nearby cells the modem can see. This is what band locking acts on: you can tell which bands neighbouring cells use and steer the modem toward or away from them. Per-PCI (per-cell) locking is not available on this modem — only whole bands.')
+					_('The serving cell and nearby cells the modem can see. Lock the modem to an LTE cell with the button on its row — "Pin to current cell" on the serving row is the safest choice. NR (5G) cells cannot be locked on this firmware. You can also steer by band on the Radio page.')
 				]),
 				E('button', {
 					'class': 'btn cbi-button-action',

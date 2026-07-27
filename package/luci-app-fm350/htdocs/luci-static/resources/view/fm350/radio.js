@@ -1,26 +1,25 @@
 'use strict';
 'require view';
 'require rpc';
-'require poll';
 'require dom';
 'require ui';
+'require fm350.progress';
 
-// FM350 radio configuration: band lock, SIM slot, APN.
+// FM350 radio configuration: band lock, cell lock, SIM slot, APN.
 //
 // This is the WRITE side. The heavy lifting lives in a procd guard (fm350-radio) that rpcd
 // hands off to: an apply is an apply/verify/revert window that can last ~2.5 minutes and
 // takes the cellular link DOWN while it runs, which is far longer than any HTTP request may
-// stay open. So nothing here blocks on the result - band_set/sim_set return immediately and
-// we watch `radio_state` (pure file reads, no AT) on a poll. Because the very link this page
-// is loaded over may be the one being retuned, a failed poll is treated as "still working,
-// keep waiting", never as an error.
+// stay open. So nothing here blocks on the result - band_set/cell_set/sim_set return
+// immediately and the shared fm350.progress controller watches `radio_state` (pure file reads,
+// no AT) on a poll and renders the progress + SIM-confirm + cell-unlock banner. Because the very
+// link this page is loaded over may be the one being retuned, a failed poll is treated by that
+// controller as "still working, keep waiting", never as an error.
 //
 // KEY HARDWARE TRUTH baked into the UI: band selection is PER-RAT and only NARROWS. Sending
 // LTE bands narrows LTE alone and leaves UMTS and NR fully enabled. You therefore CANNOT turn
 // a radio type off by unticking its bands - only by choosing a mode that omits it. The band
 // note and the greyed-out groups exist to keep that from silently lying to the user.
-
-var STATE_POLL = 3;    // radio_state cadence: drives progress + confirm banner (no AT cost)
 
 var callRadioInfo  = rpc.declare({ object: 'luci.fm350', method: 'radio_info',  expect: { '': {} } });
 var callRadioState = rpc.declare({ object: 'luci.fm350', method: 'radio_state', expect: { '': {} } });
@@ -29,7 +28,6 @@ var callBandSet    = rpc.declare({ object: 'luci.fm350', method: 'band_set',
 var callBandUnlock = rpc.declare({ object: 'luci.fm350', method: 'band_unlock', expect: { '': {} } });
 var callSimSet     = rpc.declare({ object: 'luci.fm350', method: 'sim_set',
                                    params: [ 'slot' ], expect: { '': {} } });
-var callSimConfirm = rpc.declare({ object: 'luci.fm350', method: 'sim_confirm', expect: { '': {} } });
 var callStatus     = rpc.declare({ object: 'luci.fm350', method: 'status', params: [ 'ttl' ], expect: { '': {} } });
 var callReconnect  = rpc.declare({ object: 'luci.fm350', method: 'reconnect', expect: { '': {} } });
 
@@ -101,8 +99,6 @@ var GROUP_ORDER = [ 'lte', 'nr', 'umts' ];
 var GROUP_TITLE = { lte: 'LTE', nr: 'NR (5G)', umts: 'UMTS' };
 
 return view.extend({
-	applying: false,
-
 	// --- band section ----------------------------------------------------------------
 
 	currentRat: function() {
@@ -282,8 +278,7 @@ return view.extend({
 						ui.hideModal();
 						if (!r || !r.ok)
 							return ui.addNotification(null, E('p', (r && r.error) || _('Could not start the apply.')), 'danger');
-						self.applying = true;
-						self.setProgress('applying', _('Starting…'));
+						self.progress.beginApply(_('Starting…'));
 						if (r.note)
 							ui.addNotification(null, E('p', r.note), 'info');
 					});
@@ -313,8 +308,7 @@ return view.extend({
 						ui.hideModal();
 						if (!r || !r.ok)
 							return ui.addNotification(null, E('p', (r && r.error) || _('Could not start the unlock.')), 'danger');
-						self.applying = true;
-						self.setProgress('applying', _('Starting…'));
+						self.progress.beginApply(_('Starting…'));
 						if (r.note)
 							ui.addNotification(null, E('p', r.note), 'info');
 					});
@@ -374,8 +368,7 @@ return view.extend({
 						ui.hideModal();
 						if (!r || !r.ok)
 							return ui.addNotification(null, E('p', (r && r.error) || _('Could not start the switch.')), 'danger');
-						self.applying = true;
-						self.setProgress('applying', _('Starting SIM switch…'));
+						self.progress.beginApply(_('Starting SIM switch…'));
 						if (r.note)
 							ui.addNotification(null, E('p', r.note), 'info');
 					});
@@ -448,85 +441,77 @@ return view.extend({
 		]);
 	},
 
-	// --- progress + confirm banner ---------------------------------------------------
+	// --- cell lock section (manual entry) --------------------------------------------
+	// The cells page is the point-and-click path; this is manual entry, which the lead flagged
+	// as REQUIRED rather than optional: the cell you want to pin may be too weak to appear in a
+	// scan right now, which is often exactly why you want to pin it. Ranges come from the modem's
+	// own AT+EMMCHLCK=? (ri.cell_caps), never a hard-coded LTE range. The lock/unlock UX itself
+	// (outage warning, lte_only default-on, persist default-off) is the shared progress
+	// controller's, so this page and the Cells page drive the identical flow.
 
-	stateLabel: function(s) {
-		switch (s) {
-		case 'applying':  return _('Applying…');
-		case 'verifying': return _('Verifying…');
-		case 'reverting': return _('Reverting…');
-		case 'ok':        return _('Done');
-		case 'failed':    return _('Failed');
-		case 'reverted':  return _('Reverted');
-		case 'confirm':   return _('Awaiting confirmation');
-		default:          return s;
-		}
-	},
+	cellNodes: function() {
+		var ri = this.ri;
+		var cc = ri.cell_caps || {};
+		var af = cc.arfcn || {}, pc = cc.pci || {};
+		var locked = !!ri.cell_locked;
 
-	setProgress: function(state, detail) {
-		var cls = (state === 'ok') ? 'success'
-		        : (state === 'failed' || state === 'reverted') ? 'warning' : 'info';
-		dom.content(this.progressBox, E('div', { 'class': 'alert-message ' + cls }, [
-			E('strong', {}, [ this.stateLabel(state) ]), detail ? ' ' + String(detail) : ''
-		]));
-	},
+		this.arfcnInput = E('input', { 'type': 'text', 'class': 'cbi-input-text',
+			'value': locked ? String(ri.cell_arfcn) : '' });
+		this.pciInput = E('input', { 'type': 'text', 'class': 'cbi-input-text',
+			'value': locked ? String(ri.cell_pci) : '' });
 
-	// The awaiting-confirm banner, shown here AND on the status page: a SIM switch that
-	// reached data still needs an explicit Keep, or it self-reverts at the second reboot.
-	bannerNode: function(rs) {
-		var self = this;
-		if (!rs || !(rs.awaiting_confirm || rs.state === 'confirm'))
-			return [];
-		return E('div', { 'class': 'alert-message warning' }, [
-			E('h4', {}, [ _('SIM switch awaiting confirmation') ]),
-			E('p', {}, [ rs.detail ? String(rs.detail) : _('A SIM slot switch reached data but has not been made permanent.') ]),
-			E('p', {}, [ _('Do nothing and it rolls back to the previous SIM at the second reboot. Keep it only once you have confirmed data is on the account you expect (watch for roaming charges).') ]),
-			E('div', {}, [
-				E('button', { 'class': 'btn cbi-button-action important',
-					'click': ui.createHandlerFn(this, function() {
-						return callSimConfirm().then(function() {
-							ui.addNotification(null, E('p', _('SIM switch kept.')), 'info');
-							return self.refreshState();
-						});
-					}) }, [ _('Keep this SIM') ])
+		var afHint = (af.min != null && af.max != null) ? _('valid %d–%d').format(af.min, af.max) : _('range unavailable');
+		var pcHint = (pc.min != null && pc.max != null) ? _('valid %d–%d').format(pc.min, pc.max) : _('range unavailable');
+
+		return [
+			rows(_('Current cell lock'), [
+				[ _('State'),  locked ? _('locked') : E('em', {}, [ '—' ]) ],
+				[ _('EARFCN'), locked ? val(ri.cell_arfcn) : E('em', {}, [ '—' ]) ],
+				[ _('PCI'),    locked ? val(ri.cell_pci) : E('em', {}, [ '—' ]) ]
+			]),
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('Cell lock (LTE)') ]),
+				E('p', { 'class': 'cbi-value-description' }, [
+					_('Pin the modem to a specific LTE cell by EARFCN and PCI. Manual entry is here because the cell you want may be too weak to show in a scan right now — often the very reason to pin it. NR (5G) cells cannot be locked on this firmware.')
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, [ _('EARFCN') ]),
+					E('div', { 'class': 'cbi-value-field' }, [ this.arfcnInput, ' ',
+						E('span', { 'class': 'cbi-value-description' }, [ afHint ]) ])
+				]),
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, [ _('PCI') ]),
+					E('div', { 'class': 'cbi-value-field' }, [ this.pciInput, ' ',
+						E('span', { 'class': 'cbi-value-description' }, [ pcHint ]) ])
+				]),
+				E('div', { 'class': 'right' }, [
+					E('button', { 'class': 'btn cbi-button-action important',
+						'click': ui.createHandlerFn(this, 'handleCellLock') }, [ _('Lock to this cell') ]), ' ',
+					E('button', { 'class': 'btn',
+						'disabled': locked ? null : 'disabled',
+						'click': ui.createHandlerFn(this, 'handleCellUnlock') }, [ _('Unlock') ])
+				])
 			])
-		]);
+		];
 	},
 
-	renderState: function(rs) {
-		dom.content(this.bannerBox, this.bannerNode(rs));
-
-		// A failed poll almost always means the link we are on is mid-retune. Do NOT surface
-		// an error; keep the "still working" message and let the next tick recover.
-		if (rs === null) {
-			if (this.applying)
-				this.setProgress('applying', _('Reconnecting to the router — the link is being retuned. This page recovers on its own.'));
-			return;
-		}
-
-		var s = rs.state || 'idle';
-		if (s === 'applying' || s === 'verifying' || s === 'reverting') {
-			this.applying = true;
-			this.setProgress(s, rs.detail);
-		}
-		else if (s === 'ok' || s === 'failed' || s === 'reverted') {
-			// Only react to a terminal state we caused; a stale terminal from a past apply on
-			// first load must not trigger a spurious reload.
-			if (this.applying) {
-				this.applying = false;
-				this.setProgress(s, rs.detail);
-				this.reload();
-			}
-		}
-		else if (s === 'confirm' || rs.awaiting_confirm) {
-			this.applying = false;
-			this.setProgress('confirm', rs.detail || _('SIM switch reached data — confirm to keep it in the banner above.'));
-		}
+	handleCellLock: function() {
+		var af = parseInt((this.arfcnInput.value || '').trim(), 10);
+		var pc = parseInt((this.pciInput.value || '').trim(), 10);
+		var cc = this.ri.cell_caps || {};
+		if (isNaN(af) || isNaN(pc))
+			return ui.addNotification(null, E('p', _('Enter a numeric EARFCN and PCI.')), 'danger');
+		// Soft client check against the modem's own ranges to avoid an outage on an obvious typo.
+		// The backend validates too and its error names the range, which the shared flow surfaces.
+		if (cc.arfcn && (af < cc.arfcn.min || af > cc.arfcn.max))
+			return ui.addNotification(null, E('p', _('EARFCN must be %d–%d.').format(cc.arfcn.min, cc.arfcn.max)), 'danger');
+		if (cc.pci && (pc < cc.pci.min || pc > cc.pci.max))
+			return ui.addNotification(null, E('p', _('PCI must be %d–%d.').format(cc.pci.min, cc.pci.max)), 'danger');
+		return this.progress.lock(af, pc, {});
 	},
 
-	refreshState: function() {
-		var self = this;
-		return L.resolveDefault(callRadioState(), null).then(function(rs) { self.renderState(rs); });
+	handleCellUnlock: function() {
+		return this.progress.unlock();
 	},
 
 	// --- data + plumbing -------------------------------------------------------------
@@ -543,8 +528,11 @@ return view.extend({
 			self.selRat = self.currentRat();
 			self.selBands = self.currentBands();
 			dom.content(self.bandBox, self.bandNodes());
+			dom.content(self.cellBox, self.cellNodes());
 			dom.content(self.simBox, self.simNodes());
 			dom.content(self.apnBox, self.apnNodes(res[1] || {}, res[2] || {}));
+			// Keep the shared banner's Unlock control in sync with the freshly read lock state.
+			self.progress.setLock(self.ri);
 		});
 	},
 
@@ -567,28 +555,32 @@ return view.extend({
 		this.selRat = this.currentRat();
 		this.selBands = this.currentBands();
 
-		this.bannerBox   = E('div');
-		this.progressBox = E('div');
-		this.bandBox     = E('div');
-		this.simBox      = E('div');
-		this.apnBox      = E('div');
+		this.bannerBox = E('div');
+		this.bandBox   = E('div');
+		this.cellBox   = E('div');
+		this.simBox    = E('div');
+		this.apnBox    = E('div');
 
-		dom.content(this.bannerBox, this.bannerNode(rs));
+		// Shared apply-progress + SIM-confirm + cell-unlock banner. It owns the single radio_state
+		// poll (file reads, no AT) and, via L.resolveDefault(...null), quietly survives the link
+		// dropping mid-apply. onSettle reloads this page's data once an apply lands; setLock makes
+		// its Unlock control live immediately; attach(rs) seeds it so there is no blank frame.
+		this.progress = progress.create(this.bannerBox);
+		this.progress.onSettle = L.bind(this.reload, this);
+		this.progress.setLock(this.ri);
+
 		dom.content(this.bandBox, this.bandNodes());
+		dom.content(this.cellBox, this.cellNodes());
 		dom.content(this.simBox, this.simNodes());
 		dom.content(this.apnBox, this.apnNodes(uc, st));
 
-		// One continuous, cheap radio_state poll (file reads, no AT) drives both the progress
-		// box and the confirm banner and, via L.resolveDefault(...null), quietly survives the
-		// link dropping mid-apply. Registered once; never sped up or folded elsewhere.
-		this.statePollFn = L.bind(this.refreshState, this);
-		poll.add(this.statePollFn, STATE_POLL);
+		this.progress.attach(rs);
 
 		return E([], [
 			E('h2', {}, [ _('FM350 Radio') ]),
 			this.bannerBox,
 			this.bandBox,
-			this.progressBox,
+			this.cellBox,
 			this.simBox,
 			this.apnBox
 		]);

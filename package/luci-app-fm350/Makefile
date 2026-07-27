@@ -41,6 +41,10 @@ define Package/luci-app-fm350/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/fm350
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/fm350/*.js \
 		$(1)/www/luci-static/resources/view/fm350/
+	# Shared, non-view modules (the cell-lock/apply-progress controller the three views require).
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/fm350
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/fm350/*.js \
+		$(1)/www/luci-static/resources/fm350/
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-fm350.json \
 		$(1)/usr/share/luci/menu.d/

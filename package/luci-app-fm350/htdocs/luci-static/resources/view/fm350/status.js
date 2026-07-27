@@ -4,6 +4,7 @@
 'require poll';
 'require dom';
 'require ui';
+'require fm350.progress';
 
 // FM350 status page.
 //
@@ -33,13 +34,11 @@ var callReconnect = rpc.declare({ object: 'luci.fm350', method: 'reconnect', exp
 var callReset     = rpc.declare({ object: 'luci.fm350', method: 'reset_modem', expect: { '': {} } });
 var callResetStat = rpc.declare({ object: 'luci.fm350', method: 'reset_status', expect: { '': {} } });
 
-// A SIM slot switch made on the Radio page does not auto-persist: it self-reverts at the
-// second reboot unless confirmed. That confirm must be reachable from wherever the user
-// lands, so the banner and its Keep button live on the status page too. radio_state is pure
-// file reads (no AT), so polling it cheaply on its own tick is fine.
-var BANNER = 10;
-var callRadioState = rpc.declare({ object: 'luci.fm350', method: 'radio_state', expect: { '': {} } });
-var callSimConfirm = rpc.declare({ object: 'luci.fm350', method: 'sim_confirm', expect: { '': {} } });
+// The shared fm350.progress controller supplies the apply-progress + SIM-confirm + cell-unlock
+// banner here, exactly as it does on the Cells and Radio pages: a radio change (band lock, SIM
+// switch or cell lock) started on any page stays visible if the user lands on Status, and its
+// Keep/Unlock actions are reachable here too. It polls radio_state itself (pure file reads, no
+// AT), so this page adds no modem cost for it.
 
 // Unavailable is rendered as a dash, never as a number. +CESQ reports 255 for metrics that
 // do not apply to the current radio technology, and printing that as "255 dBm" would be
@@ -259,12 +258,20 @@ return view.extend({
 		// capability, computed in bandSummary().
 		var bs = bandSummary(ri);
 		var pref = [ ri.pref1_name, ri.pref2_name ].filter(function(x) { return x; }).join(' > ');
+		// A forgotten cell lock shows up later as unexplained bad signal, and Status is where
+		// people look first — so surface it here, compactly, whenever one is active.
+		var cellLockVal = ri.cell_locked
+			? 'EARFCN %s / PCI %s'.format(
+				(ri.cell_arfcn === null || ri.cell_arfcn === undefined) ? '?' : ri.cell_arfcn,
+				(ri.cell_pci === null || ri.cell_pci === undefined) ? '?' : ri.cell_pci)
+			: E('em', {}, [ '—' ]);
 		var bandRows = [
 			[ _('RAT mode'),  val(ri.rat_name) ],
 			[ _('Preferred'), pref ? pref : E('em', {}, [ '—' ]) ],
 			[ _('Band selection'), bs.haveAny ? (bs.auto ? _('auto (all supported bands)') : _('narrowed'))
 			                                  : E('em', {}, [ '—' ]) ],
-			[ _('Enabled bands'), bs.summary ? bs.summary : E('em', {}, [ '—' ]) ]
+			[ _('Enabled bands'), bs.summary ? bs.summary : E('em', {}, [ '—' ]) ],
+			[ _('Cell lock'), cellLockVal ]
 		];
 		if (bs.haveAny && !bs.auto)
 			bs.explicit.forEach(function(line, i) {
@@ -282,48 +289,13 @@ return view.extend({
 		]);
 	},
 
-	// Awaiting-confirm banner for a SIM slot switch (mirrors the Radio page). Shown only
-	// while a pending switch is unconfirmed; the Keep button persists it via sim_confirm.
-	bannerNode: function(rs) {
-		var self = this;
-		if (!rs || !(rs.awaiting_confirm || rs.state === 'confirm'))
-			return [];
-		return E('div', { 'class': 'alert-message warning' }, [
-			E('h4', {}, [ _('SIM switch awaiting confirmation') ]),
-			E('p', {}, [ rs.detail ? String(rs.detail)
-			                       : _('A SIM slot switch reached data but has not been made permanent.') ]),
-			E('p', {}, [ _('Do nothing and it rolls back to the previous SIM at the second reboot. Keep it only once you have confirmed data is on the account you expect (watch for roaming charges).') ]),
-			E('div', {}, [
-				E('button', { 'class': 'btn cbi-button-action important',
-					'click': ui.createHandlerFn(this, function() {
-						return callSimConfirm().then(function() {
-							ui.addNotification(null, E('p', _('SIM switch kept.')), 'info');
-							return self.refreshBanner();
-						});
-					}) }, [ _('Keep this SIM') ])
-			])
-		]);
-	},
-
-	refreshBanner: function() {
-		var self = this;
-		return L.resolveDefault(callRadioState(), null).then(function(rs) {
-			dom.content(self.bannerBox, self.bannerNode(rs));
-		});
-	},
-
-	setBannerPoll: function(secs) {
-		if (this.bannerPollFn)
-			poll.remove(this.bannerPollFn);
-		var self = this;
-		this.bannerPollFn = function() { return self.refreshBanner(); };
-		poll.add(this.bannerPollFn, secs);
-	},
-
 	refreshDetail: function() {
 		var self = this;
 		return this.loadDetail().then(function(res) {
 			dom.content(self.detailContainer, self.renderDetail(res[0], res[1]));
+			// Hand the cell-lock state to the shared banner so its Unlock control is reachable
+			// from Status too, not only from the Cells list or Radio page.
+			self.progress.setLock(res[1]);
 		});
 	},
 
@@ -448,8 +420,12 @@ return view.extend({
 		this.detailContainer = E('div');
 		dom.content(this.detailContainer, this.renderDetail({}, {}));
 
-		// Empty until the banner poll finds a pending SIM confirmation.
+		// Shared apply-progress + SIM-confirm + cell-unlock banner. Empty until its own
+		// radio_state poll finds something in flight. onSettle refreshes the page once a radio
+		// change started elsewhere lands here.
 		this.bannerBox = E('div');
+		this.progress = progress.create(this.bannerBox);
+		this.progress.onSettle = function() { self.refresh(); self.refreshDetail(); };
 
 		var content = E([], [
 			E('h2', {}, [ _('FM350 Cellular Modem') ]),
@@ -480,10 +456,8 @@ return view.extend({
 		this.setDetailPoll(DETAIL);
 		this.refreshDetail();
 
-		// Cheap SIM-confirm banner poll, plus an immediate check so a pending switch shows at
-		// once when the user opens the status page.
-		this.setBannerPoll(BANNER);
-		this.refreshBanner();
+		// The shared banner polls radio_state on its own cheap tick and paints immediately.
+		this.progress.attach();
 
 		return content;
 	},
