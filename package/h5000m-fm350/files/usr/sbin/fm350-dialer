@@ -203,14 +203,21 @@ publish() {
 #
 # The sleep is what makes this safe against the respawn storm: netifd restarts a proto
 # command that exits, so failing FAST is the dangerous behaviour here, not failing slowly.
+#
+# ⚠️ The countdown is a DECREMENTING COUNTER, never a `date +%s` deadline. This board has no
+# RTC at all (no /dev/rtc*, empty /sys/class/rtc), so the clock starts at the image build date
+# and sysntpd STEPS it forward the moment the network comes up - typically well inside this
+# very window. An absolute deadline computed before that step is already in the past after it,
+# so the loop would exit on its first check with NO_MODEM + proto_block_restart, and cellular
+# would stay down until a human ran `ifup`. Same reason at_flock_wait counts down.
 MODEM_WAIT=120
-_md_end=$(( $(date +%s) + MODEM_WAIT ))
+_md_left="$MODEM_WAIT"
 _md_said=0
 while :; do
 	at_state_load && [ -n "$MODEM_NETDEV" ] && break
 	modem_discover_locked >/dev/null 2>&1
 	at_state_load && [ -n "$MODEM_NETDEV" ] && break
-	if [ "$(date +%s)" -ge "$_md_end" ]; then
+	if [ "$_md_left" -le 0 ]; then
 		if at_state_load; then
 			warn "AT port found but no RNDIS netdev after ${MODEM_WAIT}s - is kmod-usb-net-rndis installed?"
 			proto_notify_error "$INTERFACE" NO_NETDEV
@@ -229,8 +236,9 @@ while :; do
 		log "waiting for the modem to finish coming up"
 		_md_said=1
 	else
-		log_debug 'still waiting for the modem (%ss left)' "$(( _md_end - $(date +%s) ))"
+		log_debug 'still waiting for the modem (%ss left)' "$_md_left"
 	fi
+	_md_left=$(( _md_left - 10 ))
 	sleep 10
 done
 
@@ -246,7 +254,7 @@ at 'AT+CMEE=2' 6 >/dev/null 2>&1
 # Bounded, because an ABSENT SIM is genuinely not self-correcting: there is no point
 # retrying forever, and blocking restart afterwards is right.
 SIM_WAIT=60
-_sim_end=$(( $(date +%s) + SIM_WAIT ))
+_sim_left="$SIM_WAIT"
 _sim_said=0
 while :; do
 	case "$(at 'AT+CPIN?' 8)" in
@@ -260,7 +268,7 @@ while :; do
 			exit 1
 			;;
 	esac
-	if [ "$(date +%s)" -ge "$_sim_end" ]; then
+	if [ "$_sim_left" -le 0 ]; then
 		warn "SIM not ready after ${SIM_WAIT}s - is a SIM inserted? then run: ifup $INTERFACE"
 		proto_notify_error "$INTERFACE" SIM_NOT_READY
 		proto_block_restart "$INTERFACE"
@@ -270,6 +278,7 @@ while :; do
 		log "waiting for the SIM to become ready"
 		_sim_said=1
 	fi
+	_sim_left=$(( _sim_left - 5 ))
 	sleep 5
 done
 
@@ -278,8 +287,9 @@ at 'AT+CGEREP=2,1' 6 >/dev/null 2>&1
 # Registration is a precondition, but there is no radio cycling here: nothing below
 # reprovisions the attach context, so there is nothing to detach for. Removing the CFUN
 # cycle also removes the main way this dialer used to wedge the modem.
-_reg_end=$(( $(date +%s) + 90 ))
-while [ "$(date +%s)" -lt "$_reg_end" ]; do
+REG_WAIT=90
+_reg_left="$REG_WAIT"
+while [ "$_reg_left" -gt 0 ]; do
 	case "$(at 'AT+CEREG?' 6)" in
 		*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) break ;;
 		*"+CEREG: 0,3"*)
@@ -289,6 +299,7 @@ while [ "$(date +%s)" -lt "$_reg_end" ]; do
 			exit 1
 			;;
 	esac
+	_reg_left=$(( _reg_left - 5 ))
 	sleep 5
 done
 

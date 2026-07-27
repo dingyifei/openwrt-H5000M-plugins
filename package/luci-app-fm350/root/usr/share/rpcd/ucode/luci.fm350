@@ -342,8 +342,11 @@ const methods = {
 			const path = replace(usb, /'/g, '');
 			if (path == '')
 				return { ok: false, error: 'modem USB path unknown - is the modem enumerated?' };
-			run(`(echo 0 > /sys/bus/usb/devices/${path}/authorized; sleep 8; ` +
-			    `echo 1 > /sys/bus/usb/devices/${path}/authorized) >/dev/null 2>&1 &`);
+			// Delegated to fm350-usb-reset, which detaches into its own SESSION. Doing the
+			// toggle here as a backgrounded popen() left it in rpcd's process group, so an
+			// `/etc/init.d/rpcd restart` during the 8s window - which LuCI itself triggers on
+			// package install - would strand the modem at authorized=0 until a power cycle.
+			run('/usr/sbin/fm350-usb-reset >/dev/null 2>&1');
 			cache.at = 0;
 			return { ok: true, usb_path: path, note: 'reset started; allow ~70s' };
 		}

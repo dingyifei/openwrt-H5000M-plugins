@@ -142,6 +142,37 @@ else
 	ok "no ucode backend in the exec-plugin directory"
 fi
 
+echo "== bounded waits must count down, not deadline against the wall clock =="
+# This board has NO RTC (no /dev/rtc*, empty /sys/class/rtc), so the clock starts at the image
+# build date and sysntpd STEPS it forward as soon as the network is up - which lands inside the
+# dialer's 120s modem wait. A deadline built as `$(date +%s) + N` before that step is already in
+# the past after it, so the loop exits on its first check with NO_MODEM + proto_block_restart and
+# cellular stays down until a human runs `ifup`. Shipped exactly that way in three loops; all
+# three are now decrementing counters, the same idiom at_flock_wait uses.
+_clock=0
+for f in $(find "$PKGDIR" -type f \( -path '*/files/usr/sbin/*' -o -path '*/files/usr/lib/*' \) | sort); do
+	if code_of "$f" | grep -qE 'date[[:space:]]+\+%s'; then
+		bad "$(basename "$f") derives a timeout from the wall clock (date +%s)"
+		_clock=1
+	fi
+done
+[ "$_clock" -eq 0 ] && ok "no wall-clock deadlines in timing loops"
+
+echo "== the USB authorized window must be signal-isolated =="
+# Deauthorising the modem and re-authorising 8s later is the only recovery for a deaf AT port.
+# Run as a backgrounded popen() from the rpcd backend it sat in RPCD'S process group, so an
+# `/etc/init.d/rpcd restart` mid-window - which LuCI triggers on package install - stranded the
+# modem at authorized=0 until a power cycle. The window now lives in fm350-usb-reset under setsid.
+# Match the WRITE, not the word: these backends legitimately explain the mechanism in `//`
+# comments, which code_of() does not strip (it only knows `#`). Grepping for "authorized"
+# flagged the explanation of the fix as the bug.
+if find "$PKGDIR" -type f -path '*/rpcd/ucode/*' \
+		-exec grep -lE '>[[:space:]]*/sys/bus/usb' {} \; | grep -q .; then
+	bad "an rpcd backend writes the USB authorized flag directly"
+else
+	ok "rpcd backends delegate the USB reset window"
+fi
+
 echo "== LuCI app packages must reload rpcd in postinst =="
 # Without it rpcd never loads the new backend or learns the new ACL group: the menu entry
 # vanishes or every page reports "Access denied" until a reboot. luci.mk generates this

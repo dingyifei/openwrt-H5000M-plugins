@@ -47,6 +47,7 @@ define Package/h5000m-modem-atd/install
 	$(INSTALL_BIN) ./files/usr/sbin/at-lease $(1)/usr/sbin/at-lease
 	$(INSTALL_BIN) ./files/usr/sbin/modem-ports $(1)/usr/sbin/modem-ports
 	$(INSTALL_BIN) ./files/usr/sbin/h5000m-log-capture $(1)/usr/sbin/h5000m-log-capture
+	$(INSTALL_BIN) ./files/usr/sbin/fm350-usb-reset $(1)/usr/sbin/fm350-usb-reset
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/h5000m $(1)/etc/config/h5000m
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/tty

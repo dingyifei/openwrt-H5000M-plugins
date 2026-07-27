@@ -1,0 +1,113 @@
+#!/bin/sh
+# Recover a half-dead FM350 by toggling the USB device's `authorized` flag.
+#
+# This is the ONLY recovery that works for the failure where the AT port alone goes deaf:
+# `stty -F <at port>` reports "Not a tty" while every other ttyUSB and the RNDIS netdev look
+# healthy. unbind/bind does NOT fix it and can make things worse - it has left the modem
+# failing "can't set config #1, error -110" with every ttyUSB gone.
+#
+# ⚠️ WHY THIS IS A SEPARATE PROGRAM, and not three lines inside the rpcd backend:
+# the toggle has a window - roughly DOWN_SECS - during which the modem is deauthorised and
+# the router has no cellular hardware at all. The LuCI backend used to run that window as a
+# backgrounded subshell from ucode's popen(), which leaves it in RPCD'S PROCESS GROUP. LuCI
+# restarts rpcd on package install and on some config applies; a SIGTERM to that group during
+# the sleep would leave `authorized` at 0 PERMANENTLY, and only a power cycle recovers it.
+# That turns a recovery tool into the very failure it exists to repair.
+#
+# So: detach into a new session (setsid) so no process-group signal can reach the window, and
+# re-authorise from a trap so that even an individually-targeted kill still puts the device
+# back. The dangerous state is "deauthorised and nobody left to re-authorise it" - every
+# design choice here is about making that unreachable.
+#
+# usage: fm350-usb-reset            detach and return immediately (LuCI's "Reset modem")
+#        fm350-usb-reset --wait     run the window synchronously (scripted recovery)
+#
+# The AT endpoint is usable roughly 70s after re-authorisation, NOT when the tty nodes
+# reappear - they come back several seconds early. Verify with stty, never with ls.
+
+ATIO=/usr/lib/h5000m/atio.sh
+
+usage() {
+	cat <<'EOF'
+usage: fm350-usb-reset [--wait]
+
+Toggle the FM350's USB authorized flag to recover a wedged AT endpoint.
+
+  (no option)  detach into a new session and return immediately
+  --wait       perform the reset synchronously and exit when it is done
+
+The endpoint is usable ~70s after the toggle completes. Check it with
+  stty -F "$MODEM_AT_B" -a
+and not by looking for the device nodes, which reappear too early.
+EOF
+}
+
+MODE=detach
+case "${1:-}" in
+	'')            MODE=detach ;;
+	--wait)        MODE=wait ;;
+	--worker)      MODE=worker ;;   # internal: the detached child re-enters here
+	-h|--help)     usage; exit 0 ;;
+	*)             usage >&2; exit 2 ;;
+esac
+
+[ -r "$ATIO" ] || { echo "fm350-usb-reset: $ATIO not found" >&2; exit 1; }
+# Sourcing atio.sh also initialises logging as component modem_atd / tag h5000m-modem.
+. "$ATIO"
+
+DOWN_SECS="${FM350_USB_RESET_SECS:-8}"
+
+at_state_load 2>/dev/null
+if [ -z "${MODEM_USBPATH:-}" ]; then
+	log_error '%s' 'USB reset: modem USB path unknown - is the modem enumerated?'
+	exit 1
+fi
+
+AUTH="/sys/bus/usb/devices/${MODEM_USBPATH}/authorized"
+if [ ! -e "$AUTH" ]; then
+	log_error 'USB reset: %s does not exist' "$AUTH"
+	exit 1
+fi
+
+do_reset() {
+	# Re-authorise on ANY termination. Without this a kill during the sleep below leaves the
+	# modem deauthorised until someone power-cycles the router.
+	trap 'echo 1 > "$AUTH" 2>/dev/null; exit 1' INT TERM HUP
+
+	log_warn 'USB reset: deauthorising %s for %ss' "$MODEM_USBPATH" "$DOWN_SECS"
+	if ! echo 0 > "$AUTH" 2>/dev/null; then
+		log_error 'USB reset: could not write 0 to %s' "$AUTH"
+		return 1
+	fi
+
+	sleep "$DOWN_SECS"
+
+	if ! echo 1 > "$AUTH" 2>/dev/null; then
+		# The one truly bad outcome. Say exactly how to fix it by hand.
+		log_error 'USB reset: FAILED to re-authorise - recover with: echo 1 > %s' "$AUTH"
+		return 1
+	fi
+
+	trap - INT TERM HUP
+	log_warn '%s' 'USB reset: re-authorised; the AT endpoint is usable ~70s from now'
+	return 0
+}
+
+case "$MODE" in
+	worker|wait)
+		do_reset
+		exit $?
+		;;
+	detach)
+		# setsid is a busybox applet, so it is present on every build of this image; the
+		# fallback exists only so a stripped environment degrades to the old behaviour
+		# rather than not resetting at all.
+		if command -v setsid >/dev/null 2>&1; then
+			setsid "$0" --worker </dev/null >/dev/null 2>&1 &
+		else
+			log_warn '%s' 'USB reset: no setsid - the reset window is not signal-isolated'
+			( do_reset ) </dev/null >/dev/null 2>&1 &
+		fi
+		exit 0
+		;;
+esac

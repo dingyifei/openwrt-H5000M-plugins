@@ -64,9 +64,19 @@ at_exec() {
 		_cr=$(printf "\r")
 		exec 3<>"$1" 2>/dev/null || exit 1
 		printf "%s\r" "$2" >&3
-		_end=$(( $(date +%s) + $3 ))
-		while [ "$(date +%s)" -le "$_end" ]; do
-			read -r -t 1 _l <&3 || continue
+		# Countdown, not a wall-clock deadline: this board has no RTC and sysntpd steps the
+		# clock during early boot, which would make `date +%s` overshoot a deadline computed
+		# moments earlier and abandon a perfectly good exchange as a timeout. Each iteration
+		# costs at most the 1s read timeout, and the outer timeout(1) is the hard bound.
+		# Only a read that TIMED OUT costs a second, so only that decrements. Charging every
+		# iteration would truncate long replies - AT+CLAC alone returns 37 lines, which would
+		# be cut off well before OK. An endlessly chatty port is bounded by the outer timeout.
+		_left=$3
+		while [ "$_left" -gt 0 ]; do
+			if ! read -r -t 1 _l <&3; then
+				_left=$(( _left - 1 ))
+				continue
+			fi
 			_l=${_l%"$_cr"}
 			[ -z "$_l" ] && continue
 			printf "%s\n" "$_l"
@@ -142,9 +152,13 @@ at_probe() {
 	# by itself and holds no lock.
 	( at_exec "$_pr_dev" 'ATI' 2 >"$_pr_out" 2>/dev/null ) &
 
-	_pr_end=$(( $(date +%s) + 4 ))
-	while [ "$(date +%s)" -lt "$_pr_end" ]; do
+	# Countdown rather than a wall-clock deadline. Discovery runs at boot - precisely when
+	# sysntpd steps the clock on this RTC-less board - and a step mid-probe would abandon
+	# the wait instantly, marking a live AT port dead and picking the wrong one or none.
+	_pr_left=4
+	while [ "$_pr_left" -gt 0 ]; do
 		[ -s "$_pr_out" ] && break
+		_pr_left=$(( _pr_left - 1 ))
 		sleep 1
 	done
 
