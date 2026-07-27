@@ -18,5 +18,12 @@
 		"order": 20,
 		"action": { "type": "view", "path": "fm350/sms" },
 		"depends": { "acl": [ "luci-app-fm350" ] }
+	},
+
+	"admin/network/fm350/cells": {
+		"title": "Cells",
+		"order": 30,
+		"action": { "type": "view", "path": "fm350/cells" },
+		"depends": { "acl": [ "luci-app-fm350" ] }
 	}
 }

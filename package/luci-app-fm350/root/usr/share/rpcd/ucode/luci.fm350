@@ -473,6 +473,30 @@ function parse_cell_row(line) {
 	return row;
 }
 
+// Write the guard's request file and start it via procd.
+//
+// Deliberately not `popen` + background: this window lasts minutes and must survive an rpcd
+// restart, which LuCI itself triggers. The request goes in a FILE because a procd instance's
+// argv is fixed when start_service runs and `/etc/init.d/... start` forwards no arguments.
+function start_guard(body) {
+	const st = readfile(GUARD_STATE) ?? '';
+	// Refuse rather than queue: a second apply would act on state the first is still
+	// changing, and the modem cannot be retuned twice at once.
+	if (match(st, /STATE=(applying|verifying|reverting)/))
+		return { ok: false, error: 'a radio change is already in progress' };
+
+	const fd = popen('cat > /var/run/fm350-radio.req', 'w');
+	if (!fd)
+		return { ok: false, error: 'could not write the request' };
+	fd.write(body);
+	fd.close();
+
+	run('/etc/init.d/fm350-radio start >/dev/null 2>&1');
+	cache_drop('radio_cfg');
+	cache_drop('live');
+	return { ok: true, note: 'applying; the link drops briefly and reverts itself if it fails' };
+}
+
 // Reassemble concatenated ("multipart") SMS.
 //
 // A GSM SMS carries 140 bytes. Chinese cannot be expressed in GSM 7-bit, so it goes out as
@@ -693,6 +717,72 @@ const methods = {
 				pending: stale,
 				reachable: doc ? (doc.reachable ?? false) : false
 			};
+		}
+	},
+
+	// Progress of an in-flight band/slot apply. The UI polls this instead of holding a
+	// request open, because the apply window outlives any HTTP request by design.
+	radio_state: {
+		call: function() {
+			const raw = readfile(GUARD_STATE) ?? '';
+			const s = match(raw, /STATE=(\S*)/);
+			const d = match(raw, /DETAIL=(.*)/);
+			return {
+				state: s ? s[1] : 'idle',
+				detail: d ? trim(d[1]) : '',
+				// A pending record means a SIM switch is awaiting explicit confirmation;
+				// left unconfirmed it is rolled back at the second boot.
+				awaiting_confirm: !!stat('/etc/h5000m/simslot.pending')
+			};
+		}
+	},
+
+	// Hand off to the procd guard rather than doing the work here. rpcd must not own a
+	// multi-minute apply-verify-revert window: it is single-threaded, and a LuCI-triggered
+	// rpcd restart would kill exactly the timer that protects the user.
+	band_set: {
+		args: { rat: 0, bands: 'string', persist: 0 },
+		call: function(req) {
+			const rat = req.args?.rat;
+			if (rat == null || rat < 0)
+				return { ok: false, error: 'rat is required' };
+
+			// Screen every band before it reaches a shell word or an AT command. The guard
+			// runs this string through AT+GTACT=, and a malformed set command is how this
+			// modem has previously been wedged.
+			const bands = [];
+			for (let p in split(req.args?.bands ?? '', ',')) {
+				const t = trim(p);
+				if (t != '' && match(t, /^[0-9]{1,5}$/))
+					push(bands, t);
+			}
+			return start_guard(`ACTION=band\nRAT=${+rat}\nBANDS="${join(' ', bands)}"\n` +
+			                   `PERSIST=${req.args?.persist ? 1 : 0}\n`);
+		}
+	},
+
+	band_unlock: {
+		call: function() {
+			// RAT 10 is the modem's own "automatic"; with no band list it clears the lock
+			// for every RAT at once.
+			return start_guard('ACTION=band\nRAT=10\nBANDS=""\nPERSIST=0\n');
+		}
+	},
+
+	sim_set: {
+		args: { slot: 0 },
+		call: function(req) {
+			const slot = req.args?.slot;
+			if (slot != 0 && slot != 1)
+				return { ok: false, error: 'slot must be 0 (SIM) or 1 (eSIM)' };
+			return start_guard(`ACTION=slot\nSLOT=${+slot}\n`);
+		}
+	},
+
+	sim_confirm: {
+		call: function() {
+			run('/usr/sbin/fm350-radio confirm >/dev/null 2>&1');
+			return { ok: true };
 		}
 	},
 

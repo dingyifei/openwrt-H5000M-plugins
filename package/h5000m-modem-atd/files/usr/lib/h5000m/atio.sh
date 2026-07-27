@@ -324,3 +324,25 @@ at_state_load() {
 	. "$H5000M_MODEM_STATE"
 	[ -n "$MODEM_USBPATH" ]
 }
+
+# at_reg_ok <+CEREG response text> - true when the modem reports it is registered.
+#
+# Shared rather than copied: the dialer and the band/slot guard must agree on what counts as
+# registered, or the guard can revert a configuration the dialer is perfectly happy with (or
+# the reverse). The accepted set is <n>,1 (home) and <n>,5 (roaming) for both unsolicited-
+# result-code settings 0 and 1, because the guard and the dialer may see different <n>.
+at_reg_ok() {
+	case "$1" in
+		*"+CEREG: 0,1"*|*"+CEREG: 0,5"*|*"+CEREG: 1,1"*|*"+CEREG: 1,5"*) return 0 ;;
+	esac
+	return 1
+}
+
+# at_reg_denied <+CEREG response text> - the network actively refused us. Terminal: waiting
+# cannot help, so callers should stop rather than sit out their whole timeout.
+at_reg_denied() {
+	case "$1" in
+		*"+CEREG: 0,3"*|*"+CEREG: 1,3"*) return 0 ;;
+	esac
+	return 1
+}

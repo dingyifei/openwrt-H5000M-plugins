@@ -39,6 +39,9 @@ define Package/h5000m-fm350/install
 	$(INSTALL_BIN) ./files/lib/netifd/proto/fm350.sh $(1)/lib/netifd/proto/fm350.sh
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/fm350-dialer $(1)/usr/sbin/fm350-dialer
+	$(INSTALL_BIN) ./files/usr/sbin/fm350-radio $(1)/usr/sbin/fm350-radio
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/fm350-radio $(1)/etc/init.d/fm350-radio
 	$(INSTALL_DIR) $(1)/usr/lib/h5000m
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/apn-table $(1)/usr/lib/h5000m/apn-table
 	$(INSTALL_DIR) $(1)/etc/uci-defaults

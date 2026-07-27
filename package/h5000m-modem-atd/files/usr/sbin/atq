@@ -62,6 +62,15 @@ atq_check() {
 			echo "atq: refusing AT+COPS=? - a network scan blocks this port for minutes" >&2
 			exit 4
 			;;
+		# Allow the capability read, deny every other set form. First match wins, so the
+		# `=?` arm MUST come first - same structure as the +COPS arms above.
+		[Aa][Tt]+[Gg][Tt][Aa][Cc][Tt]=\?*)
+			;;
+		[Aa][Tt]+[Gg][Tt][Aa][Cc][Tt]=*|[Aa][Tt]+[Gg][Tt][Dd][Uu][Aa][Ll][Ss][Ii][Mm]=*)
+			echo "atq: refusing $1 - band and SIM-slot changes must go through fm350-radio," >&2
+			echo "     which verifies the result and reverts it if the link does not come back" >&2
+			exit 4
+			;;
 		[Aa][Tt]+[Cc][Ff][Uu][Nn]=*)
 			echo "atq: refusing AT+CFUN= - radio state belongs to the dialer" >&2
 			exit 4

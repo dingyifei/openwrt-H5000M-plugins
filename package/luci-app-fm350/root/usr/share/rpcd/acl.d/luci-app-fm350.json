@@ -9,7 +9,8 @@
 					"reset_status",
 					"ca_info",
 					"radio_info",
-					"cells"
+					"cells",
+					"radio_state"
 				]
 			}
 		},
@@ -19,7 +20,11 @@
 					"sms_send",
 					"sms_delete",
 					"reconnect",
-					"reset_modem"
+					"reset_modem",
+					"band_set",
+					"band_unlock",
+					"sim_set",
+					"sim_confirm"
 				]
 			}
 		}

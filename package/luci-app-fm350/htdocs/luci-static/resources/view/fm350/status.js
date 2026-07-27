@@ -12,7 +12,12 @@
 // modem; that is deliberate and load-bearing - the single AT port is shared with the
 // dialer keeping the link alive.
 
-var GENTLE = 15, LIVE = 3, LIVE_MAX_MS = 5 * 60 * 1000;
+// DETAIL is the cadence for the ca_info/radio_info section. It is deliberately far slower
+// than the live signal tick: carrier-aggregation layout, SIM identity and the locked-band
+// set change on the order of minutes, not seconds, and each read still costs the shared AT
+// port. It is a SEPARATE poll registration - never folded into the 3s live tick - so live
+// mode makes the top of the page fast without hammering the modem for slow-moving facts.
+var GENTLE = 15, LIVE = 3, LIVE_MAX_MS = 5 * 60 * 1000, DETAIL = 30;
 
 var callStatus = rpc.declare({
 	object: 'luci.fm350',
@@ -20,6 +25,9 @@ var callStatus = rpc.declare({
 	params: [ 'ttl' ],
 	expect: { '': {} }
 });
+
+var callCaInfo    = rpc.declare({ object: 'luci.fm350', method: 'ca_info', expect: { '': {} } });
+var callRadioInfo = rpc.declare({ object: 'luci.fm350', method: 'radio_info', expect: { '': {} } });
 
 var callReconnect = rpc.declare({ object: 'luci.fm350', method: 'reconnect', expect: { '': {} } });
 var callReset     = rpc.declare({ object: 'luci.fm350', method: 'reset_modem', expect: { '': {} } });
@@ -51,6 +59,56 @@ function rows(title, list) {
 		E('h3', {}, [ title ]),
 		E('table', { 'class': 'table' }, body)
 	]);
+}
+
+// "a × b" for the MIMO layer count, dash if either side is missing.
+function mimo(dl, ul) {
+	if ((dl === null || dl === undefined) && (ul === null || ul === undefined))
+		return E('em', {}, [ '—' ]);
+	return '%s × %s'.format(dl === null || dl === undefined ? '?' : dl,
+	                        ul === null || ul === undefined ? '?' : ul);
+}
+
+// DL/UL modulation. The backend hands these through as the modem's raw integer codes and
+// this page shows them verbatim ON PURPOSE: there is no documented, confirmed code->QAM
+// mapping for the FM350, and a mislabelled "256QAM" is worse than an honest "3" — the same
+// reason QCI is omitted entirely. Present the numbers; do not invent names for them.
+function modulation(dl, ul) {
+	if ((dl === null || dl === undefined) && (ul === null || ul === undefined))
+		return E('em', {}, [ '—' ]);
+	return 'DL %s / UL %s'.format(dl === null || dl === undefined ? '—' : dl,
+	                              ul === null || ul === undefined ? '—' : ul);
+}
+
+// Summarise the enabled band set from radio_info. `band_labels` describes the currently
+// enabled bands; `caps.bands` is the full hardware capability. "auto" is derived, not
+// guessed: it means every band the modem supports is enabled (nothing narrowed). When
+// narrowed we can group the explicit labels by RAT. This is all computed from real data,
+// so unlike a decoded mode register it cannot mislabel.
+function bandSummary(ri) {
+	var labels = ri.band_labels || [];
+	var caps = (ri.caps && ri.caps.bands) || [];
+
+	var counts = {}, order = [], perGroup = {};
+	labels.forEach(function(b) {
+		var g = (b.group || '?').toUpperCase();
+		if (!(g in counts)) { counts[g] = 0; order.push(g); perGroup[g] = []; }
+		counts[g]++;
+		if (b.label)
+			perGroup[g].push(b.label);
+	});
+
+	var summary = order.map(function(g) { return counts[g] + ' ' + g; }).join(', ');
+	// auto only when we actually know the full capability AND the enabled set matches it.
+	var auto = caps.length > 0 && labels.length === caps.length;
+	var explicit = order.map(function(g) { return g + ': ' + perGroup[g].join(', '); });
+
+	return {
+		auto: auto,
+		summary: summary || null,
+		explicit: explicit,
+		haveAny: labels.length > 0
+	};
 }
 
 return view.extend({
@@ -121,6 +179,112 @@ return view.extend({
 				])
 			])
 		]);
+	},
+
+	// --- slower detail section (carrier aggregation, SIM, bands) ---------------------
+	// Rendered into its own container and polled on its own DETAIL cadence, so it stays put
+	// while the signal block above ticks fast in live mode.
+	renderDetail: function(ca, ri) {
+		ca = ca || {};
+		ri = ri || {};
+		var out = [];
+
+		// Carrier aggregation & MIMO (ca_info). SCC rows appear only while aggregation is
+		// active; with a single carrier we show PCC and say so rather than imply a fault.
+		if (ca.reachable === false) {
+			out.push(rows(_('Carrier aggregation & MIMO'), [
+				[ _('Status'), E('em', {}, [ _('modem did not answer') ]) ]
+			]));
+		} else {
+			var carriers = ca.carriers || [];
+			if (carriers.length) {
+				var head = E('tr', { 'class': 'tr table-titles' }, [
+					E('th', { 'class': 'th' }, [ _('Carrier') ]),
+					E('th', { 'class': 'th' }, [ _('Band') ]),
+					E('th', { 'class': 'th' }, [ _('PCI') ]),
+					E('th', { 'class': 'th' }, [ _('EARFCN') ]),
+					E('th', { 'class': 'th' }, [ _('DL BW') ]),
+					E('th', { 'class': 'th' }, [ _('UL BW') ]),
+					E('th', { 'class': 'th' }, [ _('MIMO') ]),
+					E('th', { 'class': 'th' }, [ _('Modulation') ])
+				]);
+				var crows = carriers.map(function(c) {
+					return E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, [ val(c.carrier) ]),
+						E('td', { 'class': 'td' }, [ val(c.band_label) ]),
+						E('td', { 'class': 'td' }, [ val(c.pci) ]),
+						E('td', { 'class': 'td' }, [ val(c.arfcn) ]),
+						E('td', { 'class': 'td' }, [ val(c.dl_bandwidth) ]),
+						E('td', { 'class': 'td' }, [ val(c.ul_bandwidth) ]),
+						E('td', { 'class': 'td' }, [ mimo(c.dl_mimo, c.ul_mimo) ]),
+						E('td', { 'class': 'td' }, [ modulation(c.dl_modulation, c.ul_modulation) ])
+					]);
+				});
+				var section = [
+					E('h3', {}, [ _('Carrier aggregation & MIMO') ]),
+					E('table', { 'class': 'table' }, [ head ].concat(crows))
+				];
+				if (carriers.length < 2)
+					section.push(E('p', { 'class': 'cbi-value-description' }, [
+						_('No carrier aggregation active (single carrier).')
+					]));
+				out.push(E('div', { 'class': 'cbi-section' }, section));
+			} else {
+				out.push(rows(_('Carrier aggregation & MIMO'), [
+					[ _('Status'), E('em', {}, [ _('no data yet') ]) ]
+				]));
+			}
+		}
+
+		// SIM (radio_info).
+		out.push(rows(_('SIM'), [
+			[ _('Slot'), (ri.sim_slot === null || ri.sim_slot === undefined)
+			               ? E('em', {}, [ '—' ])
+			               : (ri.sim_sub ? '%s (%s)'.format(ri.sim_slot, ri.sim_sub)
+			                             : String(ri.sim_slot)) ],
+			[ _('Type'), val(ri.sim_type_name) ]
+		]));
+
+		// Bands / RAT (radio_info). "auto" is derived from the capability set, not a decoded
+		// mode register - see bandSummary().
+		var bs = bandSummary(ri);
+		var bandRows = [
+			[ _('Mode'), bs.haveAny ? (bs.auto ? _('auto (all supported bands)') : _('narrowed'))
+			                        : E('em', {}, [ '—' ]) ],
+			[ _('Enabled bands'), bs.summary ? bs.summary : E('em', {}, [ '—' ]) ]
+		];
+		if (bs.haveAny && !bs.auto)
+			bs.explicit.forEach(function(line, i) {
+				bandRows.push([ i === 0 ? _('Locked to') : '', line ]);
+			});
+		out.push(rows(_('Bands'), bandRows));
+
+		return E([], out);
+	},
+
+	loadDetail: function() {
+		return Promise.all([
+			L.resolveDefault(callCaInfo(), {}),
+			L.resolveDefault(callRadioInfo(), {})
+		]);
+	},
+
+	refreshDetail: function() {
+		var self = this;
+		return this.loadDetail().then(function(res) {
+			dom.content(self.detailContainer, self.renderDetail(res[0], res[1]));
+		});
+	},
+
+	// Registered once at DETAIL seconds and never touched by the live toggle: the slow facts
+	// must not ride the 3s tick and pound the shared AT port. Same re-registration shape as
+	// setPoll only so a future caller could retune it, not because live mode ever does.
+	setDetailPoll: function(secs) {
+		if (this.detailPollFn)
+			poll.remove(this.detailPollFn);
+		var self = this;
+		this.detailPollFn = function() { return self.refreshDetail(); };
+		poll.add(this.detailPollFn, secs);
 	},
 
 	// poll.add() fixes its interval at registration time, so switching modes means
@@ -228,6 +392,11 @@ return view.extend({
 		this.container = E('div');
 		dom.content(this.container, this.renderContent(s));
 
+		// Detail block starts with placeholder dashes; the first DETAIL poll fills it. We do
+		// not block the page's initial paint on the extra ca_info/radio_info AT reads.
+		this.detailContainer = E('div');
+		dom.content(this.detailContainer, this.renderDetail({}, {}));
+
 		var content = E([], [
 			E('h2', {}, [ _('FM350 Cellular Modem') ]),
 			E('div', { 'class': 'cbi-section' }, [
@@ -244,11 +413,17 @@ return view.extend({
 					'click': ui.createHandlerFn(this, 'handleModemReset')
 				}, [ _('Reset modem') ])
 			]),
-			this.container
+			this.container,
+			this.detailContainer
 		]);
 
 		this.pollSecs = GENTLE;
 		this.setPoll(GENTLE);
+
+		// Separate slow poll for the detail block, plus one immediate fill so the user does
+		// not stare at dashes for 30s.
+		this.setDetailPoll(DETAIL);
+		this.refreshDetail();
 
 		return content;
 	},

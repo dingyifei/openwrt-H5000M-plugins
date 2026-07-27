@@ -1,0 +1,355 @@
+#!/bin/sh
+# fm350-radio - apply a band lock or a SIM-slot switch, verify it, and revert if it did not
+# work. The only user-initiated AT WRITE path on this device.
+#
+# ⚠️ WHY THIS IS A PROCD SERVICE AND NOT A BACKGROUNDED SUBSHELL FROM THE WEB BACKEND:
+# the whole point is to be running, unattended, at the moment the link is down. A subshell
+# spawned by ucode's popen() lives in RPCD'S PROCESS GROUP, and LuCI restarts rpcd on package
+# install and on some config applies. A revert timer that dies when rpcd reloads is worse
+# than no timer at all, because it looks like protection. procd also gives single-instance
+# semantics and survival across the browser tab going away.
+#
+# ⚠️ WHY THE APPLY PATH OWNS ifdown/ifup:
+# changing bands under a live bearer drops the context. The dialer then needs two 30s poll
+# misses to declare BEARER_LOST, netifd restarts the proto, and its own 90s registration wait
+# races this script's revert decision - the guard reverts mid-bring-up, the dialer loses the
+# bearer again, and neither side can see why. Taking the interface down first removes the
+# contention entirely and frees the dialer's AT_PRIO=30 claim on the port. Bringing it back up
+# reuses the ONE bring-up sequence known to work here (deactivate_all, then the APN-type
+# ladder) instead of inventing a second one.
+#
+# ⚠️ SUCCESS IS DATA, NOT REGISTRATION. Measured after a slot switch: the modem registered
+# perfectly while every PDP activation returned +CME ERROR: 5848. A guard that accepted
+# "registered" would have called that a success and persisted it.
+#
+# ⚠️ BAND SETS ARE PER-RAT AND PARTIAL. Manual Note 5, confirmed here: sending LTE bands
+# narrows ONLY the LTE list and leaves UMTS and NR untouched. Setting BANDS="103" against
+# RAT 20 left `20,6,3,1,2,4,5,8,103,501,...` - LTE pinned to B3 while every NR band stayed
+# enabled. So "lock to B3" is not one command: the caller must also choose the RAT, or the
+# modem is still free to use 5G. The revert path therefore restores the WHOLE previous
+# parameter string rather than just the bands it changed.
+#
+# No `set -e`: `uci -q get` on an absent key returns non-zero.
+
+ATIO=/usr/lib/h5000m/atio.sh
+REQ=/var/run/fm350-radio.req
+STATE=/var/run/fm350-radio.state
+LOCK=/var/lock/fm350-radio.lock
+PENDING=/etc/h5000m/simslot.pending
+IFACE=cellular
+
+# Same tier as SMS and eSIM: user-initiated, must complete. Deliberately NOT above the
+# dialer - and in practice it does not contend, because the dialer is stopped for the window.
+AT_PRIO=20
+export AT_PRIO
+
+# Countdowns in seconds. Never wall-clock deadlines: this board has no RTC and sysntpd steps
+# the clock at boot, which would expire a deadline the instant it was computed.
+T_REG=45
+T_DATA=90
+T_ENUM=120
+
+[ -r "$ATIO" ] || { echo "fm350-radio: $ATIO not found" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ATIO"
+h5000m_log_init fm350 fm350-radio
+
+say() {
+	# The UI polls this file; it is also the cache-generation marker the rpcd backend
+	# watches, so every write here makes the web view notice the change.
+	printf 'STATE=%s\nDETAIL=%s\n' "$1" "${2:-}" > "$STATE.$$" 2>/dev/null
+	mv -f "$STATE.$$" "$STATE" 2>/dev/null
+}
+
+at_one() {
+	at_state_load 2>/dev/null || return 1
+	at_locked "$(at_lockfile "$MODEM_USBPATH" "$MODEM_AT_B_IF")" 20 \
+		"$MODEM_AT_B" "$1" "${2:-10}"
+}
+
+# L0 - the authority. Free, no AT: the interface is only genuinely usable when netifd says it
+# is up AND it has an address.
+data_ok() {
+	ubus call "network.interface.${IFACE}" status 2>/dev/null \
+		| grep -q '"up": true' || return 1
+	ubus call "network.interface.${IFACE}" status 2>/dev/null \
+		| grep -q '"address"' || return 1
+	return 0
+}
+
+wait_registered() {
+	_wr_left="$T_REG"
+	while [ "$_wr_left" -gt 0 ]; do
+		_wr_out=$(at_one 'AT+CEREG?' 8)
+		at_reg_ok "$_wr_out" && return 0
+		# Denied is terminal - the network refused us, and sitting out the rest of the
+		# timeout only delays the revert.
+		at_reg_denied "$_wr_out" && { say verifying 'network denied registration'; return 1; }
+		_wr_left=$(( _wr_left - 5 ))
+		sleep 5
+	done
+	return 1
+}
+
+wait_data() {
+	_wd_left="$T_DATA"
+	while [ "$_wd_left" -gt 0 ]; do
+		data_ok && return 0
+		_wd_left=$(( _wd_left - 5 ))
+		sleep 5
+	done
+	return 1
+}
+
+# Stop the dialer and wait for it to actually be gone, so nothing else is talking to the port
+# while we retune. Bounded: if it will not go, proceed anyway rather than hang forever - the
+# priority mechanism still applies, we just lose the guarantee of exclusivity.
+iface_down() {
+	ifdown "$IFACE" >/dev/null 2>&1
+	_id_left=15
+	while [ "$_id_left" -gt 0 ]; do
+		[ -f "/var/run/fm350-${IFACE}.pid" ] || return 0
+		_id_left=$(( _id_left - 1 ))
+		sleep 1
+	done
+	return 0
+}
+
+iface_up() { ifup "$IFACE" >/dev/null 2>&1; }
+
+# Wait for the AT endpoint to be genuinely usable again after a re-enumeration. Checks with
+# stty, NOT with `ls`: the tty nodes reappear SECONDS BEFORE the endpoint works, and looking
+# for the node made two earlier recovery attempts here report success when they had not.
+wait_endpoint() {
+	_we_left="$T_ENUM"
+	while [ "$_we_left" -gt 0 ]; do
+		# Never cache a device node across this wait - the modem re-enumerates and the
+		# hotplug handler rewrites the state file.
+		unset MODEM_AT_B MODEM_AT_B_IF MODEM_USBPATH
+		if at_state_load 2>/dev/null && [ -n "$MODEM_AT_B" ]; then
+			if stty -F "$MODEM_AT_B" -a 2>/dev/null | grep -q speed; then
+				return 0
+			fi
+		fi
+		_we_left=$(( _we_left - 5 ))
+		sleep 5
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------- apply: band
+
+apply_band() {
+	# Retry the read: nobody holds the AT port between transactions, so an unsolicited
+	# +EONSNWNAME/+CIREPI can be the first line back and the +GTACT: line arrives behind it.
+	# Reverting to a value we misread would be worse than not applying at all.
+	_ab_prev=''
+	_ab_try=3
+	while [ "$_ab_try" -gt 0 ]; do
+		_ab_prev=$(at_one 'AT+GTACT?' 10 | sed -n 's/^+GTACT: *//p' | head -1)
+		[ -n "$_ab_prev" ] && break
+		_ab_try=$(( _ab_try - 1 ))
+		sleep 2
+	done
+	[ -n "$_ab_prev" ] || { say failed 'could not read the current band configuration'; return 1; }
+
+	# ⚠️ FIELDS 2 AND 3 ARE PreferredAct1/PreferredAct2, NOT BANDS. The set form is
+	#     AT+GTACT=<rat>,<pref1>,<pref2>[,<band>...]
+	# and sending `AT+GTACT=20,103` puts a band number where only 2/3/6 are accepted - the
+	# modem answers +CME ERROR and nothing changes. Measured here.
+	#
+	# The empty-field form the manual's brackets imply, `AT+GTACT=20,,,103`, is ALSO
+	# rejected on this firmware ("+CME ERROR: phone failure"), so the preferences cannot be
+	# omitted either. Carry forward whatever the modem currently reports.
+	_ab_p1=$(printf '%s' "$_ab_prev" | cut -d, -f2)
+	_ab_p2=$(printf '%s' "$_ab_prev" | cut -d, -f3)
+
+	_ab_new="${RAT},${_ab_p1},${_ab_p2}"
+	[ -n "$BANDS" ] && for _b in $BANDS; do _ab_new="${_ab_new},${_b}"; done
+
+	say applying "AT+GTACT=${_ab_new}"
+	log_info 'applying band configuration %s (previous %s)' "$_ab_new" "$_ab_prev"
+
+	iface_down
+	if ! at_one "AT+GTACT=${_ab_new}" 15 >/dev/null; then
+		say failed 'the modem rejected the band configuration'
+		log_warn '%s' 'modem rejected AT+GTACT; nothing was changed'
+		iface_up
+		return 1
+	fi
+
+	say verifying 'waiting for the modem to register'
+	if wait_registered; then
+		iface_up
+		say verifying 'waiting for a data bearer'
+		if wait_data; then
+			say ok "band configuration ${_ab_new} active"
+			log_info 'band configuration %s verified' "$_ab_new"
+			# Persist ONLY after data is proven. A persisted lock is then, by
+			# construction, one that has carried traffic at least once.
+			if [ "${PERSIST:-0}" = 1 ]; then
+				uci -q set "network.${IFACE}.rat=$RAT"
+				uci -q set "network.${IFACE}.bands=$BANDS"
+				uci -q commit network
+				log_info '%s' 'band configuration persisted across reboot'
+			fi
+			return 0
+		fi
+	fi
+
+	# Revert to the exact string read before the change, not to "automatic": the previous
+	# setting may itself have been a deliberate lock.
+	log_warn 'band configuration %s did not carry data; reverting to %s' "$_ab_new" "$_ab_prev"
+	say reverting "restoring ${_ab_prev}"
+	iface_down
+	at_one "AT+GTACT=${_ab_prev}" 15 >/dev/null
+	iface_up
+	say reverted "reverted to the previous band configuration"
+	return 1
+}
+
+# ---------------------------------------------------------------- apply: slot
+
+apply_slot() {
+	_as_cur=$(at_one 'AT+GTDUALSIM?' 10 | sed -n 's/.*+GTDUALSIM *: *\([0-9]*\).*/\1/p' | head -1)
+	[ -n "$_as_cur" ] || { say failed 'could not read the current SIM slot'; return 1; }
+	if [ "$_as_cur" = "$SLOT" ]; then
+		say ok "already on SIM slot $SLOT"
+		return 0
+	fi
+
+	# The rollback record is written BEFORE anything is touched, and it is the one piece of
+	# state that must survive a reboot: AT+GTDUALSIM is persistent in firmware, and the
+	# failure modes here include the AT endpoint going deaf.
+	mkdir -p /etc/h5000m
+	printf 'PREV=%s\nTARGET=%s\nBOOTS=0\n' "$_as_cur" "$SLOT" > "$PENDING"
+
+	say applying "switching to SIM slot $SLOT"
+	log_warn 'switching SIM slot %s -> %s (this breaks the bearer; recovery is documented)' \
+		"$_as_cur" "$SLOT"
+
+	iface_down
+	at_one "AT+GTDUALSIM=${SLOT}" 20 >/dev/null
+
+	say verifying 'waiting for the modem to re-enumerate'
+	if ! wait_endpoint; then
+		# The measured worst case: the AT endpoint goes half-dead. The USB authorized
+		# toggle is the only thing that recovers it, and it is worth doing unprompted -
+		# the alternative is a modem nobody can talk to.
+		log_warn '%s' 'AT endpoint did not return; running a USB reset'
+		say verifying 'AT endpoint wedged - resetting USB'
+		/usr/sbin/fm350-usb-reset --wait >/dev/null 2>&1
+		wait_endpoint || { say failed 'the AT endpoint did not come back'; iface_up; return 1; }
+	fi
+
+	# EMPTY_EUICC is a TERMINAL SUCCESS, not a failure: switching to the eSIM is exactly
+	# what you do before provisioning it, and auto-reverting would make provisioning
+	# impossible. Report it and stop, rather than treating "no data" as a failed switch.
+	case "$(at_one 'AT+CPIN?' 10)" in
+		*EMPTY_EUICC*)
+			say ok "on SIM slot $SLOT - eUICC present with no profile installed"
+			log_warn '%s' 'switched to the eUICC; it has no profile, so cellular stays down'
+			rm -f "$PENDING"
+			iface_up
+			return 0
+			;;
+	esac
+
+	iface_up
+	say verifying 'waiting for a data bearer'
+	if wait_data; then
+		# Deliberately NOT auto-confirmed, unlike a band lock. "Data flows" fully proves a
+		# band change, but on a different SIM the data may be flowing on the wrong account
+		# at roaming rates - that needs a human to say yes.
+		say confirm "SIM slot $SLOT is carrying data - confirm to keep it"
+		return 0
+	fi
+
+	log_warn 'SIM slot %s did not carry data; reverting to %s' "$SLOT" "$_as_cur"
+	say reverting "restoring SIM slot $_as_cur"
+	iface_down
+	at_one "AT+GTDUALSIM=${_as_cur}" 20 >/dev/null
+	wait_endpoint
+	rm -f "$PENDING"
+	iface_up
+	say reverted "reverted to SIM slot $_as_cur"
+	return 1
+}
+
+# ---------------------------------------------------------------- entry points
+
+do_run() {
+	# -n rather than a wait: a second apply queued behind the first would act on state the
+	# first one is still changing.
+	flock -n -x 9 2>/dev/null || { echo "fm350-radio: already running" >&2; exit 3; }
+
+	[ -r "$REQ" ] || { echo "fm350-radio: no request" >&2; exit 2; }
+
+	# Claim the state file IMMEDIATELY, before the first AT read. Otherwise a caller that
+	# starts us and then polls sees the PREVIOUS run's terminal state (`ok`, `reverted`) and
+	# concludes this run already finished - which is exactly what a web UI does.
+	say applying 'starting'
+
+	# shellcheck disable=SC1090
+	. "$REQ"
+
+	# Installed FIRST, before anything can fail: the worst outcome of a killed guard must be
+	# "settings unchanged, interface back up", never "interface administratively down".
+	trap 'ifup "$IFACE" >/dev/null 2>&1; rm -f "$REQ"; exit 1' INT TERM HUP
+
+	case "${ACTION:-}" in
+		band) apply_band ;;
+		slot) apply_slot ;;
+		*) say failed "unknown action '${ACTION:-}'"; rm -f "$REQ"; exit 2 ;;
+	esac
+	_rc=$?
+
+	trap - INT TERM HUP
+	rm -f "$REQ"
+	return "$_rc"
+}
+
+# Boot-time rollback for a slot switch nobody confirmed. >=2 rather than >=1 so a deliberate
+# reboot inside a healthy confirmation window does not undo a good switch.
+do_boot_check() {
+	[ -r "$PENDING" ] || return 0
+	# shellcheck disable=SC1090
+	. "$PENDING"
+	_bc=$(( ${BOOTS:-0} + 1 ))
+	if [ "$_bc" -ge 2 ]; then
+		log_error 'SIM slot switch to %s was never confirmed across %s boots; restoring %s' \
+			"$TARGET" "$_bc" "$PREV"
+		at_one "AT+GTDUALSIM=${PREV}" 20 >/dev/null
+		rm -f "$PENDING"
+	else
+		printf 'PREV=%s\nTARGET=%s\nBOOTS=%s\n' "$PREV" "$TARGET" "$_bc" > "$PENDING"
+	fi
+	return 0
+}
+
+case "${1:-}" in
+	run)
+		mkdir -p /var/lock
+		( do_run ) 9>"$LOCK"
+		exit $?
+		;;
+	boot-check)
+		do_boot_check
+		;;
+	confirm)
+		rm -f "$PENDING"
+		say ok 'confirmed'
+		;;
+	*)
+		cat <<'EOF'
+usage: fm350-radio run | confirm | boot-check
+
+Reads its request from /var/run/fm350-radio.req:
+  ACTION=band  RAT=<n>  BANDS="<n> <n> ..."  PERSIST=0|1
+  ACTION=slot  SLOT=0|1
+
+Progress is written to /var/run/fm350-radio.state.
+EOF
+		exit 2
+		;;
+esac
