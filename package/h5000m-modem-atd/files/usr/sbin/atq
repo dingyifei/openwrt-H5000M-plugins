@@ -66,8 +66,10 @@ atq_check() {
 		# `=?` arm MUST come first - same structure as the +COPS arms above.
 		[Aa][Tt]+[Gg][Tt][Aa][Cc][Tt]=\?*)
 			;;
-		[Aa][Tt]+[Gg][Tt][Aa][Cc][Tt]=*|[Aa][Tt]+[Gg][Tt][Dd][Uu][Aa][Ll][Ss][Ii][Mm]=*)
-			echo "atq: refusing $1 - band and SIM-slot changes must go through fm350-radio," >&2
+		[Aa][Tt]+[Ee][Mm][Mm][Cc][Hh][Ll][Cc][Kk]=\?*)
+			;;
+		[Aa][Tt]+[Gg][Tt][Aa][Cc][Tt]=*|[Aa][Tt]+[Gg][Tt][Dd][Uu][Aa][Ll][Ss][Ii][Mm]=*|[Aa][Tt]+[Ee][Mm][Mm][Cc][Hh][Ll][Cc][Kk]=*)
+			echo "atq: refusing $1 - band, cell and SIM-slot changes must go through fm350-radio," >&2
 			echo "     which verifies the result and reverts it if the link does not come back" >&2
 			exit 4
 			;;

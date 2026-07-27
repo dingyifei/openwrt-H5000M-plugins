@@ -1,76 +1,35 @@
 #!/bin/sh
 # H5000M Travelmate defaults — idempotent first-boot setup.
-# Establishes exactly one disabled STA VIF bound to trm_wwan, owned by Travelmate,
-# plus the trm_wwan DHCP interface and its wan-zone firewall membership.
+# Reaps a stale placeholder STA VIF and establishes the trm_wwan DHCP interface with its
+# wan-zone firewall membership — the parts Travelmate genuinely needs from us.
 #
 # Hard rules: preserve discovered AP sections; no baked SSID/PSK; never assume mtwifi/.dat.
 #
 # No `set -e`: uci -q get on an absent key returns non-zero, which would abort the
 # script under set -e. Matches 90-h5000m-base; each step below is individually idempotent.
 
-# --- STA VIF: pick a radio (prefer 5 GHz, else first) --------------------------
-# Discover mac80211 radios generically; never hard-code radio0/radio1.
-target_radio=''
-first_radio=''
-for radio in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-device$/\1/p'); do
-	[ -n "$first_radio" ] || first_radio="$radio"
-	if [ "$(uci -q get "${radio}.band")" = '5g' ]; then
-		target_radio="$radio"
-		break
-	fi
+# --- Remove a stale placeholder STA VIF, if a prior release left one -----------
+# We used to CREATE a disabled, SSID-less STA VIF here as a "placeholder" for Travelmate to
+# fill in. Travelmate does not work that way: f_setif() reads a section's EXISTING ssid/bssid
+# and matches it against its @uplink[] list — it never WRITES an SSID. A section with no SSID
+# therefore matches no uplink, resolves enabled=0, and is force-disabled forever, while LuCI
+# renders it as "SSID: ?" (a blank, mode=Client, "wireless disabled" ghost). luci-app-travelmate
+# creates and populates its own wifi-iface when you add an uplink, so no placeholder is wanted.
+#
+# So we no longer create the section; we remove the orphan a prior release created — but ONLY
+# when all three hold: mode='sta' AND network='trm_wwan' AND ssid is absent/empty. A section
+# with an SSID is a real uplink the user configured and MUST survive untouched; that guard is
+# the entire safety of this change. Discover by attribute, never by index. AP sections
+# (mode='ap') fail the first test and are never considered.
+for iface in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
+	[ "$(uci -q get "${iface}.mode")" = 'sta' ] || continue
+	[ "$(uci -q get "${iface}.network")" = 'trm_wwan' ] || continue
+	[ -z "$(uci -q get "${iface}.ssid")" ] || continue
+	uci -q delete "$iface"
+	# Log because we removed a section the user did not ask us to, matching this file's
+	# convention for silent state changes. Guarded above, so nothing is logged on a clean run.
+	logger -t h5000m-travelmate "removed orphaned SSID-less STA VIF ${iface#wireless.} (unusable by Travelmate)"
 done
-[ -n "$target_radio" ] || target_radio="$first_radio"
-
-if [ -n "$target_radio" ]; then
-	radio_name="${target_radio#wireless.}"
-
-	# Find an existing STA VIF bound to trm_wwan (by mode+network, never by index).
-	sta_section=''
-	for iface in $(uci -q show wireless | sed -n 's/^\(wireless\.[^.]*\)=wifi-iface$/\1/p'); do
-		[ "$(uci -q get "${iface}.mode")" = 'sta' ] || continue
-		[ "$(uci -q get "${iface}.network")" = 'trm_wwan' ] || continue
-		sta_section="$iface"
-		break
-	done
-
-	# Create exactly one if none exists; otherwise normalize the one found.
-	# NAMED, not `uci add`. An anonymous section is exactly what LuCI's wireless-migration
-	# prompt ("无线配置迁移") exists to rename - it offers to rewrite it as wifinet# and
-	# RESTART THE NETWORK, which is a hostile thing to hand a user on first login. The
-	# lookup above matches on mode+network, so an already-migrated wifinet0 is adopted
-	# rather than duplicated.
-	if [ -z "$sta_section" ]; then
-		sta_section='wireless.h5000m_sta'
-		uci -q set "${sta_section}=wifi-iface"
-	else
-		# Adopting a section this script created ANONYMOUSLY on an earlier release: rename
-		# it in place. Creating named sections only helps machines flashed after today,
-		# and the units that actually have the problem are the ones already deployed -
-		# a fix that skips them is not much of a fix. uci generates anonymous names as
-		# cfg<hex>; anything else (including LuCI's own wifinet0) is already named and is
-		# left exactly as the user has it.
-		case "${sta_section#wireless.}" in
-			cfg[0-9a-f]*)
-				if uci -q rename "${sta_section}=h5000m_sta"; then
-					sta_section='wireless.h5000m_sta'
-					logger -t h5000m-travelmate "renamed anonymous STA section to h5000m_sta"
-				fi
-				;;
-		esac
-	fi
-
-	# Attach to the preferred radio only when unset, so a Travelmate retarget survives re-runs.
-	[ -n "$(uci -q get "${sta_section}.device")" ] || \
-		uci -q set "${sta_section}.device=${radio_name}"
-	uci -q set "${sta_section}.mode=sta"
-	uci -q set "${sta_section}.network=trm_wwan"
-	uci -q set "${sta_section}.disabled=1"
-	# Never bake upstream credentials — Travelmate fills these when a profile is added.
-	uci -q delete "${sta_section}.ssid"
-	uci -q delete "${sta_section}.key"
-else
-	logger -t h5000m-travelmate "no mac80211 wifi-device found; skipping STA VIF"
-fi
 
 # --- Preserve AP sections: we never touch mode='ap'; the base owns those. ------
 

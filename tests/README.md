@@ -5,13 +5,14 @@ Host-runnable, no hardware. Run both before every push:
 ```sh
 bash tests/test-plugin-invariants.sh
 sh   tests/test-log-library.sh
+sh   tests/test-travelmate-defaults.sh
 ```
 
 One further suite needs a ucode interpreter and therefore runs **on the router**, not on the
 host — see `test-sms-grouping.uc` below.
 
-Both are **negative-controlled** — every assertion was checked by injecting the violation
-and confirming the suite fails. That habit exists because this repo has already shipped a
+All three host suites are **negative-controlled** — every assertion was checked by injecting the
+violation and confirming the suite fails. That habit exists because this repo has already shipped a
 test that passed vacuously: it compared two empty files, because `uci show` with multiple
 arguments writes nothing.
 
@@ -46,6 +47,32 @@ than for the mask — a privacy control has to be proven absent, not observed to
 The suite also asserts short values (`+CESQ: 99,99,...`, `OK`) are *not* mangled, since
 over-redaction would make the logs useless.
 
+## `test-travelmate-defaults.sh` — 19 unit tests
+
+Runs the Travelmate `uci-defaults` script against a **stateful** `uci` stub (unlike the
+read-only stub in `test-log-library.sh`, this one applies set/delete/add_list so the state the
+script leaves behind can be inspected) with `logger` captured to a file.
+
+The script used to *create* a disabled, SSID-less STA VIF as a placeholder for Travelmate to
+fill in. It never gets filled: Travelmate's `f_setif()` matches a section's **existing** SSID
+against its uplink list and never writes one, so the placeholder resolved `enabled=0` forever
+and LuCI rendered it as the blank "SSID: ?" client. The script now removes that orphan instead,
+guarded so a real uplink is never touched. The suite pins that behaviour:
+
+- running twice leaves identical state (idempotent) and creates **zero** `wifi-iface` sections;
+- a **real configured uplink** (`mode=sta`, `network=trm_wwan`, with an SSID and key) survives
+  **untouched** — this is the load-bearing assertion, because the SSID guard is the entire
+  safety of the change (the negative control deletes the uplink the moment that guard is dropped);
+- an SSID-less orphan (absent *or* empty SSID) is removed and logged exactly once;
+- an AP (`mode=ap`) and a foreign-network STA (`network!=trm_wwan`) are never touched;
+- `network.trm_wwan` (DHCP) and its `wan`-zone membership are still established, without
+  clobbering an existing zone member.
+
+Every assertion is negative-controlled by mutating the script in one specific way and confirming
+that assertion — and only the expected ones — flips to FAIL (recreate the placeholder; drop each
+of the three delete guards; suppress the delete; suppress the log; skip the plumbing; break
+idempotency by making the `add_list` unconditional).
+
 ## `test-sms-grouping.uc` — 21 unit tests (runs on the router)
 
 Concatenated-SMS reassembly, exercised against the shapes that actually occurred:
@@ -75,10 +102,5 @@ mode this repo has already been bitten by.
 
 ## Still worth writing
 
-- travelmate defaults: idempotency, AP preservation, exactly one STA, band discovery
 - mwan3 policy: member ordering, no hard-coded `eth2`, `tailscale0` excluded
 - egress selector: all six transitions, invalid state, rollback, mark disjointness
-
-The travelmate one is the highest value. The anonymous-section bug would have been caught
-by running the uci-defaults twice against a mocked `uci` and asserting exactly one *named*
-STA section — a stronger invariant than the grep that currently guards it.

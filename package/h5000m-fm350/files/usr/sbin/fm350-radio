@@ -36,6 +36,9 @@ REQ=/var/run/fm350-radio.req
 STATE=/var/run/fm350-radio.state
 LOCK=/var/lock/fm350-radio.lock
 PENDING=/etc/h5000m/simslot.pending
+# The band/RAT string as it was BEFORE a cell lock narrowed it, so unlock can put it
+# back. /var/run is right: AT+GTACT is non-persistent, so a reboot clears both sides.
+PREVACT=/var/run/fm350-radio.prevact
 IFACE=cellular
 
 # Same tier as SMS and eSIM: user-initiated, must complete. Deliberately NOT above the
@@ -139,18 +142,51 @@ wait_endpoint() {
 
 # ---------------------------------------------------------------- apply: band
 
-apply_band() {
-	# Retry the read: nobody holds the AT port between transactions, so an unsolicited
-	# +EONSNWNAME/+CIREPI can be the first line back and the +GTACT: line arrives behind it.
-	# Reverting to a value we misread would be worse than not applying at all.
-	_ab_prev=''
-	_ab_try=3
-	while [ "$_ab_try" -gt 0 ]; do
-		_ab_prev=$(at_one 'AT+GTACT?' 10 | sed -n 's/^+GTACT: *//p' | head -1)
-		[ -n "$_ab_prev" ] && break
-		_ab_try=$(( _ab_try - 1 ))
+# read_gtact - the current +GTACT parameter string, retried past URCs.
+#
+# Retried because nobody holds the AT port between transactions, so an unsolicited
+# +EONSNWNAME/+CIREPI can be the first line back with the +GTACT: line behind it. Reverting to
+# a value we misread would be worse than not applying at all.
+#
+# ⚠️ CAPTURE THIS BEFORE CHANGING THE RAT. Measured: when the RAT is restricted, AT+GTACT?
+# reports only the bands of the ACTIVE radio types - selecting RAT 2 (LTE-only) made the reply
+# `2,3,3,101,102,...` with the UMTS and NR bands simply absent. A "previous value" captured
+# after a RAT change therefore cannot restore them.
+read_gtact() {
+	_rg_try=3
+	while [ "$_rg_try" -gt 0 ]; do
+		_rg=$(at_one 'AT+GTACT?' 10 | sed -n 's/^+GTACT: *//p' | head -1)
+		[ -n "$_rg" ] && { printf '%s' "$_rg"; return 0; }
+		_rg_try=$(( _rg_try - 1 ))
 		sleep 2
 	done
+	return 1
+}
+
+# pref_for_rat <rat> - a <PreferredAct> value that is valid for the given RAT.
+#
+# ⚠️ THE MODEM WILL LEAVE A PREFERENCE FIELD EMPTY BUT WILL NOT ACCEPT ONE. Measured: after a
+# cell lock set RAT 2 (LTE-only), the modem silently dropped the carried-forward 6 (NR
+# preferred) as invalid for that RAT and stored `+GTACT: 2,,3,...`. Feeding that value straight
+# back - which is what carrying the current preferences forward does - produces
+# `AT+GTACT=2,,3,...` and `+CME ERROR: phone failure`. So a band lock attempted after a cell
+# lock would fail with no obvious cause.
+#
+# The manual requires the preference to be part of the selected RAT, so pick the best one the
+# RAT actually contains: NR if present, else LTE, else UMTS.
+pref_for_rat() {
+	case "$1" in
+		14|16|17|20|10) printf '6' ;;   # includes NR
+		2|4)            printf '3' ;;   # includes LTE, no NR
+		1)              printf '2' ;;   # UMTS only
+		*)              printf '3' ;;   # unknown: LTE is in every multi-RAT mode this radio has
+	esac
+}
+
+apply_band() {
+	_ab_prev=$(read_gtact)
+	# Without this an unread previous value would build `AT+GTACT=<rat>,,` - malformed, and
+	# with nothing to revert to afterwards.
 	[ -n "$_ab_prev" ] || { say failed 'could not read the current band configuration'; return 1; }
 
 	# ⚠️ FIELDS 2 AND 3 ARE PreferredAct1/PreferredAct2, NOT BANDS. The set form is
@@ -163,6 +199,9 @@ apply_band() {
 	# omitted either. Carry forward whatever the modem currently reports.
 	_ab_p1=$(printf '%s' "$_ab_prev" | cut -d, -f2)
 	_ab_p2=$(printf '%s' "$_ab_prev" | cut -d, -f3)
+	# An empty carried-forward preference is rejected on the way back in - see pref_for_rat.
+	[ -n "$_ab_p1" ] || _ab_p1=$(pref_for_rat "$RAT")
+	[ -n "$_ab_p2" ] || _ab_p2=$(pref_for_rat "$RAT")
 
 	_ab_new="${RAT},${_ab_p1},${_ab_p2}"
 	[ -n "$BANDS" ] && for _b in $BANDS; do _ab_new="${_ab_new},${_b}"; done
@@ -205,6 +244,150 @@ apply_band() {
 	at_one "AT+GTACT=${_ab_prev}" 15 >/dev/null
 	iface_up
 	say reverted "reverted to the previous band configuration"
+	return 1
+}
+
+# ---------------------------------------------------------------- apply: cell
+#
+# AT+EMMCHLCK pins the modem to one E-UTRAN cell. Verified on this firmware:
+#
+#   AT+EMMCHLCK=?  ->  +EMMCHLCK: (0-1),(0,2,7),(0,1),(0-46589),(0-511)
+#                          enable  rat    ?      earfcn      pci
+#
+# It is ABSENT from AT+CLAC, which lists 37 commands and misses this one - the third time in
+# this project that CLAC has under-reported. CLAC finding a command proves presence; CLAC
+# missing one proves nothing.
+#
+# ⚠️ Three things that make this harder than it looks, all measured:
+#
+#  1. RAT accepts only (0,2,7) - GSM/UTRAN/E-UTRAN. There is NO NR cell locking on this
+#     firmware. The six-parameter NR form circulating online (=1,11,0,<nr-arfcn>,<pci>,3) is
+#     from a different variant and is rejected here: 11 is not in the RAT set and an NR-ARFCN
+#     exceeds the 46589 ceiling.
+#  2. The lock is accepted WITHOUT a CFUN cycle and AT+EMMCHLCK? immediately reports it - so
+#     it looks applied - but the modem does not reselect. Locked to a visible neighbour with
+#     no CFUN cycle it sat on its original cell for the full 30s observed. The lock constrains
+#     FUTURE selection only, so forcing reselection needs CFUN=0/CFUN=1.
+#  3. A cell lock does NOT stop the modem using 5G. With an LTE cell locked and the radio
+#     cycled, it camped on NR instead. EMMCHLCK constrains E-UTRAN selection and nothing else,
+#     which is why CELL_LTE_ONLY exists.
+#
+# The read form returns SIX fields where the set form takes five, so a value read back cannot
+# be replayed verbatim - see emmchlck_restore().
+
+# emmchlck_restore <previous +EMMCHLCK value> - replay a captured lock state.
+emmchlck_restore() {
+	case "${1:-0}" in
+		0|'') at_one 'AT+EMMCHLCK=0' 20 >/dev/null ;;
+		# The read form has a trailing sixth field the set form does not accept; take five.
+		*)    at_one "AT+EMMCHLCK=$(printf '%s' "$1" | cut -d, -f1-5)" 20 >/dev/null ;;
+	esac
+}
+
+apply_cell() {
+	_ac_prev_cell=$(at_one 'AT+EMMCHLCK?' 10 | sed -n 's/^+EMMCHLCK: *//p' | head -1)
+	[ -n "$_ac_prev_cell" ] || _ac_prev_cell=0
+
+	# Captured BEFORE any RAT change, for the reason in read_gtact().
+	_ac_prev_act=$(read_gtact)
+	[ -n "$_ac_prev_act" ] || { say failed 'could not read the current band configuration'; return 1; }
+
+	# An empty ARFCN means unlock.
+	if [ -z "${CELL_ARFCN:-}" ]; then
+		say applying 'clearing the cell lock'
+		iface_down
+		at_one 'AT+CFUN=0' 20 >/dev/null
+		sleep 2
+		at_one 'AT+EMMCHLCK=0' 20 >/dev/null
+		sleep 2
+		# Undo the RAT narrowing the lock applied, if any. Without this, clearing a cell lock
+		# that was taken with CELL_LTE_ONLY leaves the radio silently pinned to LTE with the
+		# UMTS and NR bands still stripped - the user asked to unlock a cell and quietly lost
+		# 5G. Measured exactly that before this existed.
+		if [ -r "$PREVACT" ]; then
+			at_one "AT+GTACT=$(cat "$PREVACT")" 20 >/dev/null
+			rm -f "$PREVACT"
+			sleep 1
+		fi
+		at_one 'AT+CFUN=1' 20 >/dev/null
+		iface_up
+		say verifying 'waiting for a data bearer'
+		if wait_data; then
+			say ok 'cell lock cleared'
+			uci -q delete network."${IFACE}".cell_arfcn
+			uci -q delete network."${IFACE}".cell_pci
+			uci -q commit network
+			return 0
+		fi
+		say failed 'cell lock cleared but no data bearer came back'
+		return 1
+	fi
+
+	say applying "AT+EMMCHLCK=1,7,0,${CELL_ARFCN},${CELL_PCI}"
+	log_info 'locking to earfcn %s pci %s (lte_only=%s)' \
+		"$CELL_ARFCN" "$CELL_PCI" "${CELL_LTE_ONLY:-0}"
+
+	iface_down
+	at_one 'AT+CFUN=0' 20 >/dev/null
+	sleep 2
+
+	if ! at_one "AT+EMMCHLCK=1,7,0,${CELL_ARFCN},${CELL_PCI}" 20 >/dev/null; then
+		say failed 'the modem rejected the cell lock'
+		at_one 'AT+CFUN=1' 20 >/dev/null
+		iface_up
+		return 1
+	fi
+
+	# Optional, and the reason this is worth doing at all: without it the modem is free to
+	# camp on NR and ignore the lock entirely. The FULL previous band list is passed through
+	# so narrowing the RAT does not silently discard a band lock set earlier.
+	if [ "${CELL_LTE_ONLY:-0}" = 1 ]; then
+		_ac_p1=$(printf '%s' "$_ac_prev_act" | cut -d, -f2)
+		_ac_p2=$(printf '%s' "$_ac_prev_act" | cut -d, -f3)
+		_ac_bands=$(printf '%s' "$_ac_prev_act" | cut -d, -f4-)
+		# The modem drops an NR preference under an LTE-only RAT and then refuses to take the
+		# empty field back, so substitute one that is valid for RAT 2 rather than pass it on.
+		[ -n "$_ac_p1" ] || _ac_p1=$(pref_for_rat 2)
+		[ -n "$_ac_p2" ] || _ac_p2=$(pref_for_rat 2)
+		# Written only if absent, so re-locking does not overwrite the ORIGINAL pre-lock value
+		# with an already-narrowed one and strand the user on LTE forever.
+		[ -e "$PREVACT" ] || printf '%s' "$_ac_prev_act" > "$PREVACT"
+		at_one "AT+GTACT=2,${_ac_p1},${_ac_p2},${_ac_bands}" 20 >/dev/null
+	fi
+
+	at_one 'AT+CFUN=1' 20 >/dev/null
+	say verifying 'waiting for the modem to register on the locked cell'
+
+	if wait_registered; then
+		iface_up
+		say verifying 'waiting for a data bearer'
+		if wait_data; then
+			say ok "locked to earfcn ${CELL_ARFCN} pci ${CELL_PCI}"
+			log_info 'cell lock verified: earfcn %s pci %s' "$CELL_ARFCN" "$CELL_PCI"
+			if [ "${PERSIST:-0}" = 1 ]; then
+				uci -q set "network.${IFACE}.cell_arfcn=$CELL_ARFCN"
+				uci -q set "network.${IFACE}.cell_pci=$CELL_PCI"
+				uci -q commit network
+				log_info '%s' 'cell lock persisted across reboot'
+			fi
+			return 0
+		fi
+	fi
+
+	log_warn 'cell earfcn %s pci %s did not carry data; reverting' "$CELL_ARFCN" "$CELL_PCI"
+	say reverting 'restoring the previous cell lock and band configuration'
+	iface_down
+	at_one 'AT+CFUN=0' 20 >/dev/null
+	sleep 2
+	emmchlck_restore "$_ac_prev_cell"
+	sleep 1
+	# Restore the band/RAT string unconditionally: even when CELL_LTE_ONLY was 0 this is a
+	# no-op, and getting it wrong the other way would leave the radio narrowed to LTE.
+	at_one "AT+GTACT=${_ac_prev_act}" 20 >/dev/null
+	rm -f "$PREVACT"
+	at_one 'AT+CFUN=1' 20 >/dev/null
+	iface_up
+	say reverted 'reverted to the previous cell and band configuration'
 	return 1
 }
 
@@ -299,6 +482,7 @@ do_run() {
 
 	case "${ACTION:-}" in
 		band) apply_band ;;
+		cell) apply_cell ;;
 		slot) apply_slot ;;
 		*) say failed "unknown action '${ACTION:-}'"; rm -f "$REQ"; exit 2 ;;
 	esac
@@ -346,6 +530,8 @@ usage: fm350-radio run | confirm | boot-check
 
 Reads its request from /var/run/fm350-radio.req:
   ACTION=band  RAT=<n>  BANDS="<n> <n> ..."  PERSIST=0|1
+  ACTION=cell  CELL_ARFCN=<n>  CELL_PCI=<n>  CELL_LTE_ONLY=0|1  PERSIST=0|1
+               (an empty CELL_ARFCN clears the lock)
   ACTION=slot  SLOT=0|1
 
 Progress is written to /var/run/fm350-radio.state.
