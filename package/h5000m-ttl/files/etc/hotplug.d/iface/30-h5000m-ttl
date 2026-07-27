@@ -1,0 +1,22 @@
+#!/bin/sh
+# h5000m TTL hook - reapply the cellular-egress TTL rule when the interface comes up.
+#
+# WHY: the generated nft rule matches on the interface's L3 device name, and that name is
+# not stable (RNDIS/netdev re-enumeration). netifd fires this hook on every iface event; on
+# ifup/ifupdate for the configured cellular interface we re-run the apply helper, which
+# re-resolves the current device and rewrites the rule only if it actually changed. This is
+# the same idempotent-hotplug pattern as 17-h5000m-mwan3-tailscale, and best-effort (|| true)
+# so a firewall hiccup can never wedge netifd's hotplug processing.
+
+case "${ACTION:-}" in
+	ifup|ifupdate) ;;
+	*) return 0 2>/dev/null || exit 0 ;;
+esac
+
+target=$(uci -q get h5000m-ttl.settings.interface) || target=cellular
+[ "${INTERFACE:-}" = "$target" ] || { return 0 2>/dev/null || exit 0; }
+
+[ -x /usr/libexec/h5000m-ttl-apply ] && /usr/libexec/h5000m-ttl-apply || true
+
+# Works whether sourced or executed directly.
+return 0 2>/dev/null || exit 0

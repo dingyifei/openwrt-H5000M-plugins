@@ -1,0 +1,41 @@
+# H5000M TTL / hop-limit normalizer.
+#
+# Rewrites the IPv4 TTL and IPv6 hop-limit of every packet egressing the cellular
+# uplink to a fixed value. The point is anti-fingerprinting: a carrier that meters or
+# blocks tethering commonly detects it by watching the TTL of packets from the modem.
+# A phone's own traffic leaves at the OS default (64); traffic that was routed once
+# through the phone arrives one hop later and leaves at 63. Pinning every egress packet
+# to a single value erases that tell. There is NO FM350 AT command for this (confirmed
+# against a live `AT+CLAC` and the 237-page AT manual), so it is done router-side with
+# nftables, exactly as the stock vendor firmware did (luci-app-qmodem-ttlfw4).
+#
+# Applied by /usr/libexec/h5000m-ttl-apply, which resolves the interface's live L3
+# device from ubus and regenerates the fw4 include under /usr/share/nftables.d, then reloads fw4.
+# A hotplug hook re-runs it whenever the interface comes up, so the rule follows the
+# device across re-enumeration (the L3 device name is NOT stable and is never hard-coded).
+
+config h5000m-ttl 'settings'
+	# Master switch. 0 = do nothing (no nft file written, firewall untouched). Off by
+	# default: this is an opt-in tweak with a real side effect (see manage_offload).
+	option enabled '0'
+
+	# TTL / hop-limit to stamp on egress packets. 1-255; 64 mimics a stock phone.
+	# 65 is the other common choice (compensates for one downstream hop so the value
+	# the carrier sees after ITS first hop is 64). Anything outside 1-255 falls back to 64.
+	option value '64'
+
+	# UCI *network interface* name of the cellular uplink (NOT a device name like eth2 or
+	# wwan0 - those renumber). The apply helper turns this into the current L3 device via
+	# `network_get_device`. Change this only if the cellular logical interface is renamed.
+	option interface 'cellular'
+
+	# Whether this package may turn flow offloading off while TTL is enabled. This MUST
+	# be 1 for the feature to actually work: fw4 flow offloading (both software and the
+	# hardware flowtable) short-circuits established connections in the ingress fast path,
+	# which BYPASSES the postrouting hook our rule lives on. With offloading on, only the
+	# first few packets of each connection get rewritten and everything after leaves at a
+	# decremented TTL - a mix that defeats the whole purpose. So when enabled=1 and this is
+	# 1, the helper sets firewall flow_offloading/flow_offloading_hw to 0 (and logs why).
+	# It never re-enables them on its own. Set this to 0 only if you have arranged another
+	# way to keep cellular-egress flows out of the flowtable and want to keep offloading on.
+	option manage_offload '1'

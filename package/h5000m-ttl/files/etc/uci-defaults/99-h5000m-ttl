@@ -1,0 +1,25 @@
+#!/bin/sh
+# H5000M TTL defaults - backfill any missing config keys, then apply once.
+#
+# The package already ships /etc/config/h5000m-ttl as a conffile, so on a fresh flash the
+# 'settings' section and its options exist before this runs. This script's real job is
+# UPGRADES: when a newer release adds an option (e.g. manage_offload) the user's preserved
+# conffile lacks it, so we fill only the keys that are missing - never overwriting a value
+# the user set. Everything here is individually idempotent (named section, guarded sets).
+#
+# No `set -e`: `uci -q get` on an absent key returns non-zero, which would abort under it.
+# Matches the house pattern in 99-h5000m-mwan3 / 99-h5000m-travelmate.
+
+[ -n "$(uci -q get h5000m-ttl.settings)" ] || uci -q set h5000m-ttl.settings='h5000m-ttl'
+[ -n "$(uci -q get h5000m-ttl.settings.enabled)" ] || uci -q set h5000m-ttl.settings.enabled='0'
+[ -n "$(uci -q get h5000m-ttl.settings.value)" ] || uci -q set h5000m-ttl.settings.value='64'
+[ -n "$(uci -q get h5000m-ttl.settings.interface)" ] || uci -q set h5000m-ttl.settings.interface='cellular'
+[ -n "$(uci -q get h5000m-ttl.settings.manage_offload)" ] || uci -q set h5000m-ttl.settings.manage_offload='1'
+uci -q commit h5000m-ttl
+
+# Apply once at first boot so an image shipped with enabled=1 preset has its rule installed
+# without waiting for the first iface event. If the cellular device is not up yet the helper
+# no-ops and the hotplug hook installs the rule when it comes up. Best-effort by design.
+[ -x /usr/libexec/h5000m-ttl-apply ] && /usr/libexec/h5000m-ttl-apply || true
+
+exit 0
