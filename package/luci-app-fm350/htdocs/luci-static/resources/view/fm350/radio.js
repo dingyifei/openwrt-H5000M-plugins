@@ -296,6 +296,15 @@ return view.extend({
 		var self = this;
 		var body = this.outageWarning();
 		body.push(E('p', {}, [ _('This returns the modem to automatic band selection for every radio type.') ]));
+		// Measured: unlock is NOT "put it back how it was". AT+GTACT=10 enables every band the
+		// radio is capable of, which on this unit was WIDER than the set enabled from the
+		// factory (30 LTE bands became 31). Saying only "automatic" would let the user read
+		// this as a restore, and there is no way back to the original subset except by
+		// ticking it explicitly.
+		body.push(E('p', { 'class': 'cbi-value-description' }, [
+			E('strong', {}, [ _('Note: this widens rather than restores.') ]), ' ',
+			_('Automatic enables every band the radio supports, which may be more than were enabled before. To return to a specific set, choose the bands explicitly instead.')
+		]));
 		body.push(E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
 			E('button', { 'class': 'btn cbi-button-action important',
