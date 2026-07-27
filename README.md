@@ -115,11 +115,12 @@ Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
 | Package | Provides |
 |---|---|
 | `h5000m-modem-atd` | FM350 AT broker: sysfs discovery, `atq`, `at-lease`, `modem-ports`, hotplug rules |
-| `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface |
+| `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface + `fm350-radio` band/slot guard |
 | `h5000m-lpac` | `h5000m-esim` — lpac over its AT backend, under the port lease |
 | `h5000m-sms` | `h5000m-sms` — `sms_tool` under the port lease; no PDU codec of our own |
 | `luci-proto-fm350` | LuCI handler so the `cellular` interface is editable in the web UI |
-| `luci-app-fm350` | Network → FM350: status, SMS, and recovery actions |
+| `luci-app-fm350` | Network → FM350: status, cells, SMS, band lock, and recovery actions |
+| `h5000m-ttl` | pins the cellular egress TTL/hop-limit via fw4; **off by default** |
 | `h5000m-travelmate-defaults` | one disabled STA VIF → `trm_wwan` |
 | `h5000m-tailscale-defaults` | `tailscale0` firewall zone, shipped logged out |
 | `h5000m-mwan3-policy` | wan → trm_wwan → cellular failover, public-IP tracking |
@@ -168,6 +169,22 @@ closure into the actual rootfs with `--network none` and asserts it equals
 
 - ✅ Proven on hardware: AT discovery, `atq`/denylist, APN programming, proto registration,
   Travelmate/Tailscale uci-defaults (idempotent over three runs, `fw4 check` clean).
+- ✅ **Band locking, verified including the failure path** (2026-07-28). Locking LTE to B3
+  applied and carried data; locking LTE-only to B14 — no coverage here — spent 45 s
+  unregistered and then **reverted itself**, restoring the link without intervention.
+  `atq` refuses `AT+GTACT=`/`AT+GTDUALSIM=` writes (rc 4) while still allowing the `AT+GTACT=?`
+  capability read (rc 0), so the guard cannot be bypassed.
+- ✅ **Multipart SMS reassembly**, against a real six-segment Chinese message whose segments
+  arrived in slots 1–6 as parts 6,3,2,4,5,1.
+- ✅ **TTL**, verified on the wire with `tcpdump` at a distinctive value — not by reading
+  `nft list`, whose counters prove traversal but not the value that actually leaves.
+- ⚠️ **The SIM-slot switch is NOT hardware-tested.** It is persistent in firmware, is known
+  to break PDP activation until the APN type changes, and has previously half-killed the AT
+  endpoint. Exercise it with physical access, never over the link it can take away.
+- ⚠️ **`h5000m-ttl` disables flow offloading while enabled.** Offloaded flows never traverse
+  postrouting, so only a flow's first packets would be rewritten — a mix of 64 and 63 on the
+  wire fingerprints tethering just as well as no rewrite at all. Ships `enabled=0`, so the
+  base image keeps offloading; `manage_offload=0` opts out of the interaction.
 - ✅ **All six packages build and the cellular closure verifies end to end.** With
   `EXTRA_DEPENDS` the dependency source-builds vanish: each package compiles in 5-10s, and
   the `config.sub` toolchain failure went away with the chain that caused it.
@@ -200,6 +217,15 @@ modem-ports                              # discovered ports and the data netdev
 modem-ports --rescan                     # re-probe after a re-enumeration
 atq 'AT+CSQ'                             # one AT command
 atq -b 'AT+CESQ' 'AT+COPS?'              # several, under ONE lock acquisition
+atq 'AT+GTACT?'                          # current RAT + band configuration
+atq -t 12 'AT+GTCCINFO?'                 # serving + neighbour cells
+fm350-usb-reset                          # recover a deaf AT port (detached, ~70s)
+
+# Band/slot changes NEVER go through atq - it refuses them - because they must be
+# verified and reverted if the link does not come back.
+printf 'ACTION=band\nRAT=20\nBANDS="103"\nPERSIST=0\n' > /var/run/fm350-radio.req
+/etc/init.d/fm350-radio start            # apply, verify against DATA, revert on failure
+cat /var/run/fm350-radio.state           # applying|verifying|reverting|ok|failed|reverted
 at-lease lpac chip info                  # hand the port to a foreign tool
 h5000m-sms -j recv                       # inbox as JSON
 h5000m-sms send 10086 '余额'              # send
