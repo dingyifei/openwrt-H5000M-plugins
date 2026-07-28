@@ -11,8 +11,10 @@
 					"radio_info",
 					"cells",
 					"radio_state",
-					"ttl_get"
-				]
+					"ttl_get",
+					"archive_get"
+				],
+				"service": [ "list" ]
 			}
 		},
 		"write": {
@@ -28,13 +30,15 @@
 					"sim_confirm",
 					"cell_set",
 					"cell_unlock",
-					"ttl_set"
+					"ttl_set",
+					"archive_set"
 				]
 			},
 			"uci": [
 				"network",
 				"firewall",
-				"h5000m-ttl"
+				"h5000m-ttl",
+				"h5000m"
 			]
 		}
 	}

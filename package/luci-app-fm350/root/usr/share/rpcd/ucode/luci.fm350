@@ -640,13 +640,76 @@ function start_guard(body) {
 // read the same as before.
 function group_messages(msgs) { return grouping.group_messages(msgs); }
 
-// A distinct, lower-confidence failure than the multipart bug: sms_tool does not escape the
-// `sender` field in its JSON, so an alphanumeric sender ID could in principle produce output
-// that json() rejects. Silently returning an empty inbox would then read as "no messages" -
-// indistinguishable from a genuinely empty store - so say so in syslog. logger, not a ucode
-// log module, because this backend has no other logging dependency and one line is enough.
-function warn_log(msg) {
-	run(`logger -t fm350-ui -p daemon.warning ${shq(msg)} 2>/dev/null`);
+// Level-gated logging for this backend, through UCI's `h5000m.logging.ui` (falling back to
+// the global `h5000m.logging.level`) - the SAME ordinal contract the `h5000m` log.sh library
+// uses everywhere else, but this backend is ucode and log.sh is POSIX shell, so it cannot be
+// sourced here. This is a deliberately NARROWER subset of that contract: level-gating only,
+// no redaction and no dedup. Nothing logged through this call ever carries SMS bodies, phone
+// numbers or other identifiers - only small integers/booleans (archiver settings) or a fixed
+// parse-failure notice - so there is nothing here that needs masking. If a future caller ever
+// needs to log something sensitive, it must NOT go through this helper unmodified.
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
+
+function ui_log(level, msg) {
+	const comp = trim(run('uci -q get h5000m.logging.ui 2>/dev/null') ?? '');
+	const glob = trim(run('uci -q get h5000m.logging.level 2>/dev/null') ?? '');
+	const want = LOG_LEVELS[(comp != '') ? comp : ((glob != '') ? glob : 'info')] ?? LOG_LEVELS.info;
+	if ((LOG_LEVELS[level] ?? LOG_LEVELS.info) > want)
+		return;
+	run(`logger -t fm350-ui -p daemon.${level} ${shq(msg)} 2>/dev/null`);
+}
+
+// Single source for the modem store's used/total counters - sms_list and archive_get both
+// need them, and a second copy of this regex would be exactly the kind of drift this file's
+// own comments elsewhere warn about.
+function sms_status() {
+	const s = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
+	const m = match(s, /used:\s*(\d+),\s*total:\s*(\d+)/);
+	return { used: m ? +m[1] : null, total: m ? +m[2] : null };
+}
+
+// True only if procd reports a LIVE instance. The service is always started at boot
+// (postinst runs `/etc/init.d/h5000m-sms-archive enable`) - `running` reflects the PROCESS,
+// the UCI `enabled` flag reflects whether it is actively doing anything each cycle. The two
+// are deliberately distinct on the settings page: a stopped service and a disabled one look
+// different to an operator and mean different things.
+function archive_running() {
+	try {
+		const bus = connect();
+		const r = bus.call('service', 'list', { name: 'h5000m-sms-archive' });
+		bus.disconnect();
+		const inst = r?.['h5000m-sms-archive']?.instances ?? {};
+		for (let k in inst)
+			if (inst[k]?.running)
+				return true;
+		return false;
+	} catch (e) {
+		return false;
+	}
+}
+
+// Ephemeral (/var/run - tmpfs, gone on reboot) one-line-per-field summary the archiver's shell
+// driver writes after every cycle it actually runs. This is NOT the durable archive - it is
+// purely so the settings page can show "when did this last run and what happened" without
+// grepping logread. Missing/unparseable -> all null, the same graceful-degradation posture
+// read_archive() already uses for absent runtime state.
+function archive_status_file() {
+	const out = { last_run: null, last_result: null, last_summary: null };
+	const raw = readfile('/var/run/h5000m-sms-archive.status');
+	if (raw == null || raw == '')
+		return out;
+	for (let line in split(raw, '\n')) {
+		const m = match(line, /^([a-z_]+)=(.*)$/);
+		if (!m) continue;
+		// last_run is a formatted "YYYY-MM-DD HH:MM:SS" string, not an epoch - the shell
+		// driver deliberately avoids `date +%s` here (see its own comment) since this is a
+		// display timestamp, not a deadline, and the wall-clock-deadline invariant this repo
+		// enforces elsewhere does not distinguish the two by content alone.
+		if (m[1] == 'last_run') out.last_run = (m[2] != '') ? m[2] : null;
+		else if (m[1] == 'last_result') out.last_result = m[2];
+		else if (m[1] == 'last_summary') out.last_summary = m[2];
+	}
+	return out;
 }
 
 // Read the persistent archive. Missing or unparseable -> empty, no error surfaced: the same
@@ -1017,7 +1080,7 @@ const methods = {
 				// Do NOT swallow this into an empty inbox: that is indistinguishable from a
 				// genuinely empty store and hid a real parse failure. Warn, then continue with
 				// no live messages so the archived ones still render.
-				warn_log(`sms_list: could not parse recv JSON (${e}) - showing archived only`);
+				ui_log('warn', `sms_list: could not parse recv JSON (${e}) - showing archived only`);
 				msgs = [];
 			}
 
@@ -1044,14 +1107,13 @@ const methods = {
 			// would understate how full the store is, which is the opposite of useful.
 			// used/total stay MODEM-ONLY: they are the number actually at risk of overflowing;
 			// archived messages are off the modem and cannot fill it.
-			const stat = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
-			const m = match(stat, /used:\s*(\d+),\s*total:\s*(\d+)/);
+			const st = sms_status();
 			return {
 				messages: all,
 				segments: length(msgs),
 				archived_count: length(archived),
-				used: m ? +m[1] : null,
-				total: m ? +m[2] : null
+				used: st.used,
+				total: st.total
 			};
 		}
 	},
@@ -1127,6 +1189,97 @@ const methods = {
 				return { ok: false, deleted: length(list) - length(failed),
 				         failed: failed, output: trim(output) };
 			return { ok: true, deleted: length(list), output: trim(output) };
+		}
+	},
+
+	// Router-side SMS FIFO archive (package h5000m-sms-archive, optional - EXTRA_DEPENDS on
+	// luci-app-fm350). The mechanism is UCI-only otherwise: this is the settings page's read
+	// side, mirroring ttl_get's shape (config + live/derived status in one call so the view
+	// has no second round trip).
+	archive_get: {
+		call: function() {
+			const g = function(o, d) {
+				const v = trim(run(`uci -q get h5000m.sms_archive.${o} 2>/dev/null`) ?? '');
+				return v != '' ? v : d;
+			};
+			const st = sms_status();
+			const stf = archive_status_file();
+			return {
+				// The worker binary, not the init script: this is "can it actually do
+				// anything", the same intent as ttl_get's `installed` check.
+				installed: !!stat('/usr/sbin/h5000m-sms-archive-worker'),
+				running: archive_running(),
+				enabled: g('enabled', '0') == '1',
+				threshold: +g('threshold', '70'),
+				batch_size: +g('batch_size', '10'),
+				interval: +g('interval', '900'),
+				max_messages: +g('max_messages', '0'),
+				storage_path: g('storage_path', '/etc/h5000m/sms-archive.json'),
+				archived_count: length(read_archive()),
+				used: st.used, total: st.total,
+				last_run: stf.last_run,
+				last_result: stf.last_result,
+				last_summary: stf.last_summary
+			};
+		}
+	},
+
+	// Every bound here is enforced server-side ONLY - the view screens blank/NaN and shows
+	// whatever error string comes back, the same split TTL uses, so the range has one owner.
+	// None of these five values need a service restart to take effect: the archiver re-reads
+	// all of them from UCI every wake cycle by design (see h5000m-sms-archive's own header
+	// comment) - only a LOG LEVEL change needs a restart, and that is not this method's concern.
+	archive_set: {
+		args: { enabled: 0, threshold: 0, batch_size: 0, interval: 0, max_messages: 0 },
+		call: function(req) {
+			const a = req.args ?? {};
+			const fields = {
+				enabled:      (a.enabled ? 1 : 0) + '',
+				threshold:    ('' + (+(a.threshold ?? 70))),
+				batch_size:   ('' + (+(a.batch_size ?? 10))),
+				interval:     ('' + (+(a.interval ?? 900))),
+				max_messages: ('' + (+(a.max_messages ?? 0)))
+			};
+
+			// Bounds: threshold/batch_size against the modem's realistic slot range (ME
+			// storage can exceed the ~90 SM slots observed, but stays well under 500);
+			// interval floors at 60s to match the driver's own floor, so a value rejected
+			// here is never silently re-floored later without the caller knowing; 0 is a
+			// valid, deliberate max_messages meaning "unbounded" (the shipped default).
+			if (+fields.threshold < 1 || +fields.threshold > 500) {
+				ui_log('warn', `sms_archive: rejected threshold=${fields.threshold} (must be 1-500)`);
+				return { ok: false, error: 'threshold must be 1-500' };
+			}
+			if (+fields.batch_size < 1 || +fields.batch_size > 100) {
+				ui_log('warn', `sms_archive: rejected batch_size=${fields.batch_size} (must be 1-100)`);
+				return { ok: false, error: 'batch_size must be 1-100' };
+			}
+			if (+fields.interval < 60 || +fields.interval > 86400) {
+				ui_log('warn', `sms_archive: rejected interval=${fields.interval} (must be 60-86400)`);
+				return { ok: false, error: 'interval must be 60-86400 seconds' };
+			}
+			if (+fields.max_messages < 0 || +fields.max_messages > 100000) {
+				ui_log('warn', `sms_archive: rejected max_messages=${fields.max_messages} (must be 0-100000)`);
+				return { ok: false, error: 'max_messages must be 0 (unbounded) to 100000' };
+			}
+
+			// Audit trail: this is the one write path that can turn on automatic message
+			// deletion, so log exactly what changed - not just that "settings were saved".
+			// Read-before-write rather than trusting the caller's own request, since a
+			// no-op save (identical values re-submitted) should not spam syslog.
+			const changed = [];
+			for (let k in fields) {
+				const old = trim(run(`uci -q get h5000m.sms_archive.${k} 2>/dev/null`) ?? '');
+				if (old != fields[k]) {
+					push(changed, `${k} ${old || '(unset)'}->${fields[k]}`);
+					run(`uci -q set h5000m.sms_archive.${k}=${shq(fields[k])}`);
+				}
+			}
+			if (length(changed)) {
+				run('uci -q commit h5000m');
+				ui_log('info', `sms_archive settings changed: ${join(', ', changed)}`);
+			}
+			return { ok: true, changed: length(changed) };
 		}
 	},
 

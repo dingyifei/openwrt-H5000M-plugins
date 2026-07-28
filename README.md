@@ -110,7 +110,7 @@ Substitute any feature-set name for `travelmate`: `cellular`, `esim`, `tailscale
 
 ## Stage 2 — feature packages (updated 2026-07-27)
 
-Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
+Eleven config/script-only packages, all `PKGARCH:=all`, no credentials:
 
 | Package | Provides |
 |---|---|
@@ -118,21 +118,24 @@ Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
 | `h5000m-fm350` | netifd proto `fm350` + dialer + IMSI→APN table + `cellular` interface + `fm350-radio` band/cell/slot guard |
 | `h5000m-lpac` | `h5000m-esim` — lpac over its AT backend, under the port lease |
 | `h5000m-sms` | `h5000m-sms` — `sms_tool` under the port lease; no PDU codec of our own |
+| `h5000m-sms-archive` | FIFO-archives the oldest modem SMS to the router past a configurable threshold, deletes them from the modem, and covers the archive in every config backup; **off by default** |
 | `luci-proto-fm350` | LuCI handler so the `cellular` interface is editable in the web UI |
-| `luci-app-fm350` | Network → FM350: status, cells, SMS, band lock, and recovery actions |
+| `luci-app-fm350` | Network → FM350: status, cells, SMS, SMS archive settings, band lock, TTL and recovery actions |
 | `h5000m-ttl` | pins the cellular egress TTL/hop-limit via fw4; **off by default** |
 | `h5000m-travelmate-defaults` | the `trm_wwan` DHCP interface + wan-zone membership; reaps an SSID-less orphan STA |
 | `h5000m-tailscale-defaults` | `tailscale0` firewall zone, shipped logged out |
 | `h5000m-mwan3-policy` | wan → trm_wwan → cellular failover, public-IP tracking |
 
-Three host-side suites, all negative-controlled — injecting each violation makes them fail:
+Three host-side suites, all negative-controlled — injecting each violation makes them fail
+(exact counts drift as checks are added; `tests/README.md` is the source of truth):
 
-`tests/test-plugin-invariants.sh` (48 checks) enforces rules learned the hard way on
+`tests/test-plugin-invariants.sh` (52 checks) enforces rules learned the hard way on
 hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -w`
 (busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
 credentials, no anonymous `wifi-iface` sections, LuCI protocol handlers must `return` the
-registered class, and rpcd backends must take no direct serial access, set `AT_PRIO=1`,
-live in `/usr/share/rpcd/ucode`, and reload rpcd in postinst.
+registered class, rpcd backends must take no direct serial access, set `AT_PRIO=1`,
+live in `/usr/share/rpcd/ucode`, and reload rpcd in postinst, and every UCI config an rpcd
+backend writes must be granted in that same package's own ACL.
 
 `tests/test-log-library.sh` (21 checks) unit-tests the logging library with `uci` and
 `logger` stubbed, so it needs no device. The redaction assertions grep for the actual
@@ -185,7 +188,13 @@ closure into the actual rootfs with `--network none` and asserts it equals
   `atq` refuses `AT+GTACT=`/`AT+GTDUALSIM=` writes (rc 4) while still allowing the `AT+GTACT=?`
   capability read (rc 0), so the guard cannot be bypassed.
 - ✅ **Multipart SMS reassembly**, against a real six-segment Chinese message whose segments
-  arrived in slots 1–6 as parts 6,3,2,4,5,1.
+  arrived in slots 1–6 as parts 6,3,2,4,5,1. Deleting the reassembled row removes all six
+  slots in one request — a partial delete used to orphan the rest silently.
+- ⚠️ **The SMS archive (`h5000m-sms-archive`) has a settings page (Network → FM350 → SMS
+  Archive) but has never run an archive+delete pass against real messages.** Ships
+  `enabled=0`; the merge/UI/backup plumbing is verified, but an actual archive cycle needs to
+  be exercised on hardware — ideally against a throwaway message rather than a real inbox —
+  before turning it on for normal use.
 - ✅ **TTL**, verified on the wire with `tcpdump` at a distinctive value — not by reading
   `nft list`, whose counters prove traversal but not the value that actually leaves.
 - ⚠️ **`AT+GTACT` is NOT reliably non-persistent**, despite the manual marking it so: an
@@ -250,6 +259,9 @@ cat /var/run/fm350-radio.state           # applying|verifying|reverting|ok|faile
 at-lease lpac chip info                  # hand the port to a foreign tool
 h5000m-sms -j recv                       # inbox as JSON
 h5000m-sms send 10086 '余额'              # send
+
+uci set h5000m.sms_archive.enabled=1     # turn on the FIFO archiver (also: Network > FM350 >
+uci commit h5000m                        # SMS Archive - the LuCI page just edits this same UCI)
 
 uci set h5000m.logging.fm350=trace       # error|warn|info|debug|trace, per component
 uci commit h5000m                        # long-lived processes need a restart to notice

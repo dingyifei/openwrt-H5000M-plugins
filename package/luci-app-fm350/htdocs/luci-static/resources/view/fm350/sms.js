@@ -98,7 +98,15 @@ return view.extend({
 				_('Modem store: %d of %d used (%d%%).').format(d.used, d.total, pct),
 				pct >= 80 ? E('strong', { 'style': 'color:#a00' }, [
 					' ' + _('Nearly full — delete messages or new ones will be rejected without warning.')
-				]) : ''
+				]) : '',
+				// archived_count is always present once h5000m-sms-archive is installed (0 when
+				// its store is empty or it is disabled) - shown whenever it is a number so the
+				// router-side count is visible from the page it actually affects, without a
+				// second trip to the Archive settings page just to see whether it is doing
+				// anything.
+				(d.archived_count !== null && d.archived_count !== undefined)
+					? E('span', {}, [ ' ' + _('%d message(s) held in the router\'s SMS archive.').format(d.archived_count) ])
+					: ''
 			]);
 		}
 
