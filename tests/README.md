@@ -64,13 +64,42 @@ hygiene:
   the rpcd backends but a separate check (a pure library has no `AT_PRIO` to set);
 - every `/lib/upgrade/keep.d/*` entry is an absolute path and never under `/tmp` or `/var`
   (tmpfs, wiped each boot) — the one property the SMS archive's persistence depends on;
-- every UCI config an rpcd backend `uci set`s must appear in that package's own ACL
+- every UCI config an rpcd backend mutates must appear in that package's own ACL
   `write.uci` — otherwise the write fails silently for any session but root's full-trust
   one. Caught for real: `archive_set` landed a `uci set h5000m.sms_archive.*` call a commit
-  before the ACL was extended to grant `h5000m` at all.
+  before the ACL was extended to grant `h5000m` at all. "Mutates" covers
+  `set|delete|add_list|del_list|rename|commit`, not just `set` — a method that only deletes or
+  only commits changes UCI just as much, and the backend already contains a bare
+  `uci -q commit h5000m` that the first version of this check could not see. The grep is also
+  scoped to the `write.uci` array rather than the whole file, so a config granted only under
+  `read` no longer satisfies a check whose entire subject is writes;
+- a record of state that outlives a reboot must itself outlive one — `fm350-radio`'s pre-lock
+  band string may not sit on tmpfs. It did, justified by the manual's claim that `AT+GTACT` is
+  non-persistent; the modem kept the setting and tmpfs did not, so unlock had nothing to restore
+  and silently reported success;
+- no UI string may claim a reboot clears a radio lock. It said so in three places
+  ("your guaranteed way out"), and a false escape hatch is worse than none — it sends someone
+  who has lost their uplink to reboot instead of unlock.
 
 The shell-syntax check skips files whose shebang is `ucode`: they are not POSIX sh, and `sh -n`
 would reject valid ucode. Their syntax is exercised on-target instead.
+
+### `code_of` vs `jscode_of`
+
+Two comment strippers, because assertions must test **code, not prose** — every rule here is
+discussed at length in comments, so a naive grep flags its own documentation.
+
+`code_of` strips `#` to end-of-line (shell). `jscode_of` strips whole-line `//` comments
+(JS/ucode) and deliberately **not** trailing ones: removing `//` mid-line would corrupt any
+string containing it, and these checks grep prose, where a false negative costs far less than a
+false positive.
+
+`jscode_of` exists because a wording check is otherwise **defeated by its own fix**. The commit
+that removes a bad string almost always adds a comment quoting it — that is the documentation
+style used throughout this repo — so the check keeps failing on the explanation of why it now
+passes. Both the null-rpc check and the ACL check were originally grepping raw files and hit
+exactly this; using `code_of` on a ucode file would have been wrong too, since a `#` inside a
+string truncates the line.
 
 ## `test-log-library.sh` — 21 unit tests
 

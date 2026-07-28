@@ -182,6 +182,19 @@ closure into the actual rootfs with `--network none` and asserts it equals
   cell (data at 91 ms), lock to a nonexistent PCI (65 s unregistered, **reverted itself**),
   and unlock restoring both the lock *and* the RAT. ⚠️ **The command is absent from
   `AT+CLAC`** — CLAC is a lower bound, not an inventory.
+- ⚠️ **A cell lock binds idle-mode selection only; the network can still move you.** Measured
+  with the lock held constant at EARFCN 1650 / PCI 188: with the bearer **down** the modem sat
+  on the locked cell for 90 s without deviating; with the bearer **up** it held ~35 s and the
+  operator then moved it to PCI 187 and kept it there, at comparable RSRP. Connected-mode
+  handover is the network's decision, not the UE's. The guard therefore reports the cell it
+  actually landed on rather than claiming success on registration + data alone — otherwise the
+  Cells page showing a different cell reads as our bug rather than the operator's choice.
+- ⛔ **Radio settings survive a reboot, and there is no "keep after reboot" option.** After a
+  genuine reboot (uptime 28 s) with **nothing in UCI**, the modem still reported both the cell
+  lock and the narrowed `+GTACT`. The manual's `Persistent: No` for `AT+GTACT` is wrong, and the
+  widely-repeated claim that a cell lock is lost on power loss did not hold here either. Undo is
+  **Unlock**, never a reboot; the UI used to promise otherwise in three places. (Honest limit: a
+  warm reboot need not cut M.2 power, so a *cold* power-off remains untested.)
 - ✅ **Band locking, verified including the failure path** (2026-07-28). Locking LTE to B3
   applied and carried data; locking LTE-only to B14 — no coverage here — spent 45 s
   unregistered and then **reverted itself**, restoring the link without intervention.
@@ -197,9 +210,13 @@ closure into the actual rootfs with `--network none` and asserts it equals
   before turning it on for normal use.
 - ✅ **TTL**, verified on the wire with `tcpdump` at a distinctive value — not by reading
   `nft list`, whose counters prove traversal but not the value that actually leaves.
-- ⚠️ **`AT+GTACT` is NOT reliably non-persistent**, despite the manual marking it so: an
-  NR-only lock survived a full sysupgrade and reboot. Do not treat a power cycle as the escape
-  hatch from a bad band lock; clear it explicitly.
+- ✅ **The orphaned Travelmate STA VIF fix, proven both directions** (2026-07-28). A real
+  uplink built the way `luci-app-travelmate`'s own `stations.js` builds one (`ssid` +
+  `encryption` + `key`) survives the reaper across two runs, while an SSID-less orphan planted
+  beside it is removed in the same pass — `key`, `network.trm_wwan` and the single `wan`-zone
+  membership all intact. The guard is also safe by construction: `stations.js` **refuses** to
+  save an uplink with an empty SSID, so the reaper can never match a section that UI produced.
+  Not covered: associating to a real access point, which needs credentials.
 - ⚠️ **A `+GTACT` value read from the modem may not be replayable** — it reports empty
   preference fields but refuses to accept one, so every revert path must sanitise before
   replaying. This was a live bug in the guard's revert, not a theoretical one.
