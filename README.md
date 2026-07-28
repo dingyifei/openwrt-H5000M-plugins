@@ -127,7 +127,7 @@ Nine config/script-only packages, all `PKGARCH:=all`, no credentials:
 
 Three host-side suites, all negative-controlled — injecting each violation makes them fail:
 
-`tests/test-plugin-invariants.sh` (38 checks) enforces rules learned the hard way on
+`tests/test-plugin-invariants.sh` (48 checks) enforces rules learned the hard way on
 hardware: no `proto_set_keep 1`, no hard-coded `ttyUSB`/`eth` names, no `flock -w`
 (busybox has no such flag), no `set -u` in a netifd proto command, no bashisms, no
 credentials, no anonymous `wifi-iface` sections, LuCI protocol handlers must `return` the
@@ -188,6 +188,15 @@ closure into the actual rootfs with `--network none` and asserts it equals
   arrived in slots 1–6 as parts 6,3,2,4,5,1.
 - ✅ **TTL**, verified on the wire with `tcpdump` at a distinctive value — not by reading
   `nft list`, whose counters prove traversal but not the value that actually leaves.
+- ⚠️ **`AT+GTACT` is NOT reliably non-persistent**, despite the manual marking it so: an
+  NR-only lock survived a full sysupgrade and reboot. Do not treat a power cycle as the escape
+  hatch from a bad band lock; clear it explicitly.
+- ⚠️ **A `+GTACT` value read from the modem may not be replayable** — it reports empty
+  preference fields but refuses to accept one, so every revert path must sanitise before
+  replaying. This was a live bug in the guard's revert, not a theoretical one.
+- ⚠️ **`sms_tool` can hang holding the AT port**, taking the dialer down with it. Now bounded
+  by `timeout` in the wrapper, with a shorter cap for deletes so a bad slot cannot exceed
+  ubus's request budget.
 - ⚠️ **The SIM-slot switch is NOT hardware-tested.** It is persistent in firmware, is known
   to break PDP activation until the APN type changes, and has previously half-killed the AT
   endpoint. Exercise it with physical access, never over the link it can take away.

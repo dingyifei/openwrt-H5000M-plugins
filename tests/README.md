@@ -16,7 +16,7 @@ violation and confirming the suite fails. That habit exists because this repo ha
 test that passed vacuously: it compared two empty files, because `uci show` with multiple
 arguments writes nothing.
 
-## `test-plugin-invariants.sh` — 47 static checks
+## `test-plugin-invariants.sh` — 48 static checks
 
 Every rule exists because the corresponding mistake was actually made, not as hypothetical
 hygiene:
@@ -36,6 +36,25 @@ hygiene:
 - rpcd backends must take no direct serial access, must set `AT_PRIO=1`, must live in
   `/usr/share/rpcd/ucode` rather than the exec-plugin directory, and their Makefile must
   reload rpcd in postinst;
+- **no wall-clock deadlines.** This board has no RTC, so sysntpd steps the clock during early
+  boot — inside the dialer's own 120 s modem wait. A `$(date +%s) + N` deadline computed before
+  the step is already in the past after it, and the loop exits instantly with `NO_MODEM` +
+  `proto_block_restart`. Five loops shipped that way; count down instead;
+- **the USB `authorized` window must be signal-isolated** — run from rpcd's process group, an
+  `/etc/init.d/rpcd restart` mid-window strands the modem at `authorized=0` until a power cycle;
+- **every LuCI resource module must `return` a class** built with `.extend(`. A bare object
+  literal gives `"factory yields invalid constructor"` and kills every page that requires it.
+  This trap was hit **twice** — first `protocol/fm350.js` with no `return`, then
+  `resources/fm350/progress.js` returning an object literal — because the original check was
+  written to the shape of the first bug rather than to the rule it broke;
+- **a dotted require must name its alias.** LuCI derives an un-aliased name as
+  `dep.replace(/[^a-zA-Z0-9_]/g,'_')`, so `'require fm350.progress'` binds `fm350_progress`,
+  not `progress`, and every page dies at first use with a `ReferenceError`;
+- **never pass `null` as a declared rpc argument.** ubus types each argument from the backend's
+  exemplar and rejects a null outright, so the call never reaches the backend at all — SMS
+  delete silently never ran. The check is anchored with `[^)]*` so it stays inside the call's
+  own parens: the first version flagged `L.resolveDefault(callX(), null)`, where the null
+  belongs to `resolveDefault`. A check that cries wolf on correct code is worse than none;
 - a `procd_set_param respawn`, where present, must carry three numeric args — a wrong count
   silently changes respawn behaviour and shows up only as a service that never comes back
   (the check validates the form, it does not force respawn: fm350-radio deliberately omits it);
