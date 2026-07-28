@@ -234,15 +234,24 @@ pref_for_rat() {
 #
 # Fills any empty preference from the string's OWN rat, so the replay means the same thing.
 #
-# ⛔ AND IT MUST NOT APPEND A TRAILING COMMA. The first version ended with an unconditional
+# ⚠️ RETRACTION - it is the empty PREFERENCE that is refused, NOT a trailing empty band.
+# An earlier version of this comment claimed the original unconditional
 #     printf '%s,%s,%s,%s' ... "$rest"
-# which is correct only when a band list follows. For the very case named above it produced:
-#     14,6,    -> 14,6,6,     <- still a trailing empty field, still `phone failure`
-#     14,6,6   -> 14,6,6,
-# So the helper written to make strings replayable emitted an unreplayable string for every
-# band-less input, and all three revert paths stayed broken while looking fixed. apply_band
-# already had this right (it appends bands only when the list is non-empty); the rule simply
-# was not carried across. A trailing empty field is the SAME defect as a leading empty one.
+# was a live bug because it turned `14,6,` into `14,6,6,`, and that the trailing empty field
+# was "the same defect as a leading empty one". MEASURED, and that is wrong:
+#     AT+GTACT=14,6,     rc=2   +CME ERROR: phone failure    <- empty PREFERENCE, refused
+#     AT+GTACT=14,,      rc=2   +CME ERROR: phone failure
+#     AT+GTACT=14,,6     rc=2   +CME ERROR: phone failure
+#     AT+GTACT=14,6,6,   rc=0                                <- empty BAND, ACCEPTED
+#     AT+GTACT=14,6,6    rc=0
+# So the old code was not broken, and the claim was reasoned rather than tested - the same
+# mistake this file documents elsewhere about trusting the manual. What the helper genuinely
+# fixes is the empty preference; the band handling below is tidiness, not a repair.
+#
+# ⚠️ A band-less string is NOT neutral - it ENABLES EVERY BAND of that RAT. Measured:
+# `AT+GTACT=2,3,3` read back as `2,3,3,101,102,...,166`, the full LTE set. That is the right
+# restore here only because a CAPTURED string with no band list already meant "all bands".
+# Never use the band-less form to mean "leave the bands alone".
 #
 # Parameter expansion rather than `cut`: four forks became zero, on a path the rest of this
 # file is careful about.
@@ -284,8 +293,9 @@ gtact_bands() {
 }
 
 # gtact_join <rat> <"p1,p2"> <bands or empty> -> the set string.
-# ⛔ THE TRAILING COMMA IS THE WHOLE POINT. `AT+GTACT=14,6,6,` is rejected exactly like the
-# `14,6,` it was built to replace, so the band list may only be appended when it is non-empty.
+# The band list is appended only when non-empty. NOT because a trailing comma is refused - it
+# is accepted, measured - but because `14,6,6` is what the modem itself reports and there is no
+# reason to hand back a form it never produced.
 gtact_join() {
 	if [ -n "$3" ]; then
 		printf '%s,%s,%s' "$1" "$2" "$3"
