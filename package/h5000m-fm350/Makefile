@@ -47,6 +47,13 @@ define Package/h5000m-fm350/install
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/98-h5000m-fm350 \
 		$(1)/etc/uci-defaults/98-h5000m-fm350
+	# fm350-radio keeps two pieces of state here (the pending SIM slot and the pre-lock
+	# band string). It was relying on h5000m-sms-archive to create this directory, which
+	# is a dependency nothing declares - own it here as well; INSTALL_DIR is idempotent.
+	$(INSTALL_DIR) $(1)/etc/h5000m
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/h5000m-fm350 \
+		$(1)/lib/upgrade/keep.d/h5000m-fm350
 endef
 
 $(eval $(call BuildPackage,h5000m-fm350))

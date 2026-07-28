@@ -163,7 +163,7 @@ return view.extend({
 		]);
 	},
 
-	// The confirm modal, the outage warning and the lte_only/persist options all live in the
+	// The confirm modal, the outage warning and the lte_only option all live in the
 	// shared progress controller, so Cells and Radio drive the identical lock UX.
 	handleLock: function(arfcn, pci, serving) {
 		return this.progress.lock(arfcn, pci, { serving: serving });

@@ -18,6 +18,15 @@ bad()  { checks=$((checks+1)); fails=$((fails+1)); printf '  [FAIL] %s\n' "$1"; 
 # rules is discussed at length in comments, so a naive grep would flag its own docs.
 code_of() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$1"; }
 
+# JS/ucode equivalent: drops WHOLE-LINE `//` comments only. Deliberately not trailing ones -
+# stripping `//` mid-line would corrupt any string containing it (a URL, a regex) and this is
+# used for grepping prose, where a false negative is far worse than a little leftover noise.
+#
+# Needed because a check that greps for wording is otherwise defeated by its own fix: the commit
+# that removes a bad string usually adds a comment quoting it, so the check keeps failing on the
+# explanation of why it passes now.
+jscode_of() { sed -e 's|^[[:space:]]*//.*$||' -e '/^[[:space:]]*$/d' "$1"; }
+
 echo "== shell syntax =="
 for f in $(find "$PKGDIR" -type f \
 		\( -path '*/files/usr/sbin/*' -o -path '*/files/usr/lib/*' \
@@ -316,6 +325,38 @@ for f in $(find "$PKGDIR" -type f -path '*/lib/upgrade/keep.d/*' | sort); do
 	done < "$f"
 done
 [ "$_keepseen" -eq 1 ] && [ "$_keep" -eq 0 ] && ok "keep.d entries are absolute and persistent"
+
+echo "== a record of persistent MODEM state must not itself live on tmpfs =="
+# fm350-radio saves the band/RAT string from BEFORE a cell lock so unlock can put it back. That
+# file sat in /var/run, justified by the manual's claim that AT+GTACT is "Persistent: No" - so
+# the modem and the record of it would be cleared together by a reboot.
+#
+# Measured false: after a genuine reboot the modem still reported the narrowed +GTACT, while
+# tmpfs really had been wiped. The two sides came apart - the radio stayed pinned to LTE and the
+# only record of what it was before was gone, so unlock silently restored nothing and reported
+# success. The lesson generalises past this one file: state describing something that outlives a
+# reboot has to outlive one too. Anchored to the assignment so a mention in prose does not count.
+_prevact=$(grep -hE '^[A-Z_]*PREVACT=' "$PKGDIR/h5000m-fm350/files/usr/sbin/fm350-radio" 2>/dev/null | head -1)
+case "$_prevact" in
+	*=/var/*|*=/tmp/*) bad "fm350-radio stores the pre-lock band string on tmpfs: $_prevact" ;;
+	*=/etc/*)          ok  "fm350-radio stores the pre-lock band string persistently" ;;
+	'')                bad "fm350-radio has no PREVACT assignment to check" ;;
+	*)                 bad "fm350-radio PREVACT is in an unexpected location: $_prevact" ;;
+esac
+
+echo "== the UI must not promise that a reboot clears a radio lock =="
+# It did, in three places ("your guaranteed way out", "clears on the next reboot"). Measured
+# false on hardware: both the cell lock and the band configuration survived a real reboot with
+# nothing written to uci. A false escape hatch is worse than none - it sends a user who has lost
+# their uplink to reboot instead of unlock, leaving them just as stuck.
+_promise=0
+for f in $(find "$PKGDIR/luci-app-fm350" -name '*.js' | sort); do
+	if jscode_of "$f" | grep -qiE "clears? (on|at) the next reboot|dies at the next reboot|guaranteed way out"; then
+		bad "$(basename "$f") tells the user a reboot clears a radio lock"
+		_promise=1
+	fi
+done
+[ "$_promise" -eq 0 ] && ok "no UI text claims a reboot clears a radio lock"
 
 echo
 echo "checks=${checks} failures=${fails}"

@@ -22,7 +22,7 @@ var POLL = 3;
 var callRadioState = rpc.declare({ object: 'luci.fm350', method: 'radio_state', expect: { '': {} } });
 var callSimConfirm = rpc.declare({ object: 'luci.fm350', method: 'sim_confirm', expect: { '': {} } });
 var callCellSet    = rpc.declare({ object: 'luci.fm350', method: 'cell_set',
-                                   params: [ 'arfcn', 'pci', 'lte_only', 'persist' ], expect: { '': {} } });
+                                   params: [ 'arfcn', 'pci', 'lte_only' ], expect: { '': {} } });
 var callCellUnlock = rpc.declare({ object: 'luci.fm350', method: 'cell_unlock', expect: { '': {} } });
 
 function stateLabel(s) {
@@ -163,7 +163,6 @@ Progress.prototype.lock = function(arfcn, pci, opts) {
 	var self = this;
 	opts = opts || {};
 	var lteOnly = E('input', { 'type': 'checkbox', 'checked': 'checked' });
-	var persist = E('input', { 'type': 'checkbox' });
 
 	var body = outageWarning();
 	body.push(E('div', { 'class': 'cbi-value' }, [
@@ -175,17 +174,22 @@ Progress.prototype.lock = function(arfcn, pci, opts) {
 	body.push(E('p', { 'class': 'cbi-value-description' }, [
 		_('A cell lock constrains LTE only — without this the modem may camp on 5G/NR and ignore the lock entirely. Unlock later restores the previous radio configuration.')
 	]));
-	body.push(E('div', { 'class': 'cbi-value' }, [
-		E('label', {}, [ persist, ' ', _('Keep after reboot') ])
-	]));
+	// ⚠️ There was a "Keep after reboot" checkbox here, described as default-OFF because
+	// "a lock that clears at the next reboot is your guaranteed way out". MEASURED FALSE:
+	// after a genuine reboot with nothing written to uci, the modem still reported the cell
+	// lock AND the narrowed band configuration. The escape hatch never existed, and saying it
+	// did is worse than saying nothing - it invites rebooting instead of unlocking, which
+	// leaves the user exactly as stuck but more confused. Tell the truth and point at the
+	// control that does work.
 	body.push(E('p', { 'class': 'cbi-value-description' }, [
-		_('Default OFF on purpose: a lock that clears at the next reboot is your guaranteed way out if it kills the link. Persisting writes UCI, and only after data is proven.')
+		E('strong', {}, [ _('This lock survives a reboot.') ]), ' ',
+		_('The modem stores it itself, so restarting the router will not clear it — use Unlock here to undo it. LuCI is reachable over LAN even when the cellular link is down, so Unlock stays available. If the lock cannot carry data at all, the router rolls it back on its own within about 90 seconds.')
 	]));
 	body.push(E('div', { 'class': 'right' }, [
 		E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
 		E('button', { 'class': 'btn cbi-button-action important',
 			'click': ui.createHandlerFn(self, function() {
-				return callCellSet(arfcn, pci, lteOnly.checked ? 1 : 0, persist.checked ? 1 : 0).then(function(r) {
+				return callCellSet(arfcn, pci, lteOnly.checked ? 1 : 0).then(function(r) {
 					ui.hideModal();
 					// The backend's error names the valid range; surface it verbatim.
 					if (!r || !r.ok)

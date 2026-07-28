@@ -24,7 +24,7 @@
 var callRadioInfo  = rpc.declare({ object: 'luci.fm350', method: 'radio_info',  expect: { '': {} } });
 var callRadioState = rpc.declare({ object: 'luci.fm350', method: 'radio_state', expect: { '': {} } });
 var callBandSet    = rpc.declare({ object: 'luci.fm350', method: 'band_set',
-                                   params: [ 'rat', 'bands', 'persist' ], expect: { '': {} } });
+                                   params: [ 'rat', 'bands' ], expect: { '': {} } });
 var callBandUnlock = rpc.declare({ object: 'luci.fm350', method: 'band_unlock', expect: { '': {} } });
 var callSimSet     = rpc.declare({ object: 'luci.fm350', method: 'sim_set',
                                    params: [ 'slot' ], expect: { '': {} } });
@@ -216,8 +216,6 @@ return view.extend({
 		dom.content(this.bandListBox, this.renderBandList());
 		this.bandNoteBox = E('div');
 		dom.content(this.bandNoteBox, this.renderBandNote());
-		this.persistCb = E('input', { 'type': 'checkbox' });
-
 		var pref = [ this.ri.pref1_name, this.ri.pref2_name ].filter(function(x) { return x; }).join(' > ');
 
 		return [
@@ -234,14 +232,14 @@ return view.extend({
 				]),
 				this.bandNoteBox,
 				this.bandListBox,
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, [ _('Keep after reboot') ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						this.persistCb, ' ',
-						E('span', { 'class': 'cbi-value-description' }, [
-							_('Default OFF on purpose: a band lock that dies at the next reboot is your guaranteed way out if it kills the link. Persisting writes UCI, and is offered only because the guard does so AFTER data is proven.')
-						])
-					])
+				// ⚠️ A "Keep after reboot" checkbox lived here, sold as default-OFF because
+				// a lock that dies at reboot was "your guaranteed way out". MEASURED FALSE:
+				// after a real reboot with nothing in uci the modem still reported the
+				// narrowed +GTACT. The modem stores this itself; the checkbox changed
+				// nothing either way. Say what actually happens instead.
+				E('p', { 'class': 'cbi-value-description' }, [
+					E('strong', {}, [ _('A band lock survives a reboot.') ]), ' ',
+					_('The modem stores it, so restarting the router will not undo it — use “Unlock (automatic)” for that. If the chosen bands cannot carry data, the router puts the previous configuration back on its own within about 90 seconds.')
 				]),
 				E('div', { 'class': 'right' }, [
 					E('button', { 'class': 'btn cbi-button-action important',
@@ -258,17 +256,17 @@ return view.extend({
 		var self = this;
 		var rat = +this.ratSelect.value;
 		var bands = this.collectBands();
-		var persist = this.persistCb.checked ? 1 : 0;
 
 		var body = progress.outageWarning();
-		body.push(persist
-			? E('p', {}, [ E('strong', {}, [ _('“Keep after reboot” is ON — this lock will be written to config and survive a reboot.') ]) ])
-			: E('p', {}, [ _('This lock clears on the next reboot (your guaranteed way out).') ]));
+		body.push(E('p', {}, [
+			E('strong', {}, [ _('This survives a reboot.') ]), ' ',
+			_('Undo it with “Unlock (automatic)” — note that unlock enables every band the radio supports, which is wider than whatever you had before.')
+		]));
 		body.push(E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
 			E('button', { 'class': 'btn cbi-button-action important',
 				'click': ui.createHandlerFn(this, function() {
-					return callBandSet(rat, bands, persist).then(function(r) {
+					return callBandSet(rat, bands).then(function(r) {
 						ui.hideModal();
 						if (!r || !r.ok)
 							return ui.addNotification(null, E('p', (r && r.error) || _('Could not start the apply.')), 'danger');
@@ -440,7 +438,7 @@ return view.extend({
 	// as REQUIRED rather than optional: the cell you want to pin may be too weak to appear in a
 	// scan right now, which is often exactly why you want to pin it. Ranges come from the modem's
 	// own AT+EMMCHLCK=? (ri.cell_caps), never a hard-coded LTE range. The lock/unlock UX itself
-	// (outage warning, lte_only default-on, persist default-off) is the shared progress
+	// (outage warning, lte_only default-on, the survives-a-reboot note) is the shared progress
 	// controller's, so this page and the Cells page drive the identical flow.
 
 	cellNodes: function() {

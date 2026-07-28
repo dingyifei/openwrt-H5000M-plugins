@@ -36,9 +36,17 @@ REQ=/var/run/fm350-radio.req
 STATE=/var/run/fm350-radio.state
 LOCK=/var/lock/fm350-radio.lock
 PENDING=/etc/h5000m/simslot.pending
-# The band/RAT string as it was BEFORE a cell lock narrowed it, so unlock can put it
-# back. /var/run is right: AT+GTACT is non-persistent, so a reboot clears both sides.
-PREVACT=/var/run/fm350-radio.prevact
+# The band/RAT string as it was BEFORE a cell lock narrowed it, so unlock can put it back.
+#
+# ⚠️ THIS MUST OUTLIVE A REBOOT. It used to live in /var/run, justified by the manual's claim
+# that AT+GTACT is "Persistent: No" - so a reboot would clear the modem and the record of it
+# together. MEASURED FALSE: after a genuine reboot (uptime 28s, nothing in uci) the modem still
+# reported the narrowed `+GTACT: 2,3,3,...` AND the cell lock. tmpfs, meanwhile, really is
+# cleared. So the two sides came apart: the radio stayed pinned to LTE while the record of what
+# it was before was gone, and unlock below silently skipped its restore and reported success -
+# stranding the user on LTE with the NR bands stripped, which is the exact failure that restore
+# exists to prevent. Persistent state needs persistent storage.
+PREVACT=/etc/h5000m/fm350-radio.prevact
 IFACE=cellular
 
 # Same tier as SMS and eSIM: user-initiated, must complete. Deliberately NOT above the
@@ -95,6 +103,17 @@ wait_registered() {
 		sleep 5
 	done
 	return 1
+}
+
+# The PCI we are ACTUALLY camped on, empty if the modem will not say.
+#
+# A cell lock binds idle-mode cell SELECTION. Handover, once a bearer is up, is decided by the
+# NETWORK, and it may move us straight back off the locked cell. Measured on this unit: with
+# the bearer down the modem sat on the locked cell for 90s solid; with the bearer up it held
+# ~35s and the network then moved it to a different PCI and kept it there, at comparable RSRP.
+# So "registered, and data flows" does NOT mean "camped where you asked".
+serving_pci() {
+	at_one 'AT+GTCCINFO?' 15 2>/dev/null | grep '^1,' | cut -d, -f8 | tr -d ' \r'
 }
 
 wait_data() {
@@ -250,14 +269,13 @@ apply_band() {
 		if wait_data; then
 			say ok "band configuration ${_ab_new} active"
 			log_info 'band configuration %s verified' "$_ab_new"
-			# Persist ONLY after data is proven. A persisted lock is then, by
-			# construction, one that has carried traffic at least once.
-			if [ "${PERSIST:-0}" = 1 ]; then
-				uci -q set "network.${IFACE}.rat=$RAT"
-				uci -q set "network.${IFACE}.bands=$BANDS"
-				uci -q commit network
-				log_info '%s' 'band configuration persisted across reboot'
-			fi
+			# ⛔ There used to be a `PERSIST=1` branch here writing
+			# network.<iface>.rat/.bands to uci. It was removed because it was
+			# doing nothing twice over. Nothing ever READ those options - not this
+			# script, not fm350-dialer, not /lib/netifd/proto/fm350.sh - and the
+			# setting persists anyway: measured after a genuine reboot with uci
+			# empty, the modem still reported the narrowed +GTACT. So the flag made
+			# no difference in either position while implying a choice existed.
 			return 0
 		fi
 	fi
@@ -340,9 +358,6 @@ apply_cell() {
 		say verifying 'waiting for a data bearer'
 		if wait_data; then
 			say ok 'cell lock cleared'
-			uci -q delete network."${IFACE}".cell_arfcn
-			uci -q delete network."${IFACE}".cell_pci
-			uci -q commit network
 			return 0
 		fi
 		say failed 'cell lock cleared but no data bearer came back'
@@ -393,13 +408,19 @@ apply_cell() {
 		iface_up
 		say verifying 'waiting for a data bearer'
 		if wait_data; then
-			say ok "locked to earfcn ${CELL_ARFCN} pci ${CELL_PCI}"
-			log_info 'cell lock verified: earfcn %s pci %s' "$CELL_ARFCN" "$CELL_PCI"
-			if [ "${PERSIST:-0}" = 1 ]; then
-				uci -q set "network.${IFACE}.cell_arfcn=$CELL_ARFCN"
-				uci -q set "network.${IFACE}.cell_pci=$CELL_PCI"
-				uci -q commit network
-				log_info '%s' 'cell lock persisted across reboot'
+			# Report where we ACTUALLY are, not merely that the write was accepted. The
+			# lock can be perfectly applied and the network still steer us elsewhere; a
+			# flat "locked to X" would then be a success message for a state the user
+			# does not have, and the Cells page showing a different serving cell would
+			# read as a bug in us rather than as the operator's decision.
+			_ac_at=$(serving_pci)
+			if [ -n "$_ac_at" ] && [ "$_ac_at" != "$CELL_PCI" ]; then
+				say ok "lock set on earfcn ${CELL_ARFCN} pci ${CELL_PCI}, but the network moved us to pci ${_ac_at}"
+				log_info 'cell lock set (earfcn %s pci %s); serving cell is pci %s - network handover, not a failure' \
+					"$CELL_ARFCN" "$CELL_PCI" "$_ac_at"
+			else
+				say ok "locked to earfcn ${CELL_ARFCN} pci ${CELL_PCI}"
+				log_info 'cell lock verified: earfcn %s pci %s' "$CELL_ARFCN" "$CELL_PCI"
 			fi
 			return 0
 		fi
@@ -560,10 +581,14 @@ case "${1:-}" in
 usage: fm350-radio run | confirm | boot-check
 
 Reads its request from /var/run/fm350-radio.req:
-  ACTION=band  RAT=<n>  BANDS="<n> <n> ..."  PERSIST=0|1
-  ACTION=cell  CELL_ARFCN=<n>  CELL_PCI=<n>  CELL_LTE_ONLY=0|1  PERSIST=0|1
+  ACTION=band  RAT=<n>  BANDS="<n> <n> ..."
+  ACTION=cell  CELL_ARFCN=<n>  CELL_PCI=<n>  CELL_LTE_ONLY=0|1
                (an empty CELL_ARFCN clears the lock)
   ACTION=slot  SLOT=0|1
+
+There is no PERSIST option: the modem keeps its own band/RAT selection and cell lock
+across a reboot whatever we do, so there is nothing to opt into. Use the unlock form
+(empty CELL_ARFCN) to undo a cell lock - a reboot will not.
 
 Progress is written to /var/run/fm350-radio.state.
 EOF

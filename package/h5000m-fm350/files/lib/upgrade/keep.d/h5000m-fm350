@@ -1,0 +1,13 @@
+# Keep fm350-radio's persistent state across a settings-preserving sysupgrade, and include it
+# in `sysupgrade -b` / LuCI "Generate archive" backups.
+#
+# Named files rather than the whole /etc/h5000m/ directory: h5000m-sms-archive already claims
+# the directory form, and two packages shipping the same keep.d path would collide.
+#
+# Why these must survive an upgrade, not just a reboot: the modem's own band/RAT selection and
+# cell lock are stored in the MODEM, and were measured to survive both a reboot and a full
+# sysupgrade - the manual's "Persistent: No" for AT+GTACT is wrong. So the radio comes back
+# from an upgrade still narrowed, and if the record of what it was BEFORE the lock did not come
+# back with it, unlock has nothing to restore and silently leaves the radio pinned to LTE.
+/etc/h5000m/fm350-radio.prevact
+/etc/h5000m/simslot.pending

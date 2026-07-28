@@ -883,7 +883,7 @@ const methods = {
 	// multi-minute apply-verify-revert window: it is single-threaded, and a LuCI-triggered
 	// rpcd restart would kill exactly the timer that protects the user.
 	band_set: {
-		args: { rat: 0, bands: 'string', persist: 0 },
+		args: { rat: 0, bands: 'string' },
 		call: function(req) {
 			const rat = req.args?.rat;
 			if (rat == null || rat < 0)
@@ -898,15 +898,14 @@ const methods = {
 				if (t != '' && match(t, /^[0-9]{1,5}$/))
 					push(bands, t);
 			}
-			return start_guard(`ACTION=band\nRAT=${+rat}\nBANDS="${join(' ', bands)}"\n` +
-			                   `PERSIST=${req.args?.persist ? 1 : 0}\n`);
+			return start_guard(`ACTION=band\nRAT=${+rat}\nBANDS="${join(' ', bands)}"\n`);
 		}
 	},
 
 	// Cell lock. The heavy lifting - CFUN cycle, reselection wait, revert - is the guard's;
 	// this only validates and hands off, for the same reason band_set does.
 	cell_set: {
-		args: { arfcn: 0, pci: 0, lte_only: 0, persist: 0 },
+		args: { arfcn: 0, pci: 0, lte_only: 0 },
 		call: function(req) {
 			const a = req.args?.arfcn, p = req.args?.pci;
 			if (a == null || p == null)
@@ -919,8 +918,7 @@ const methods = {
 			if (c?.pci && (p < c.pci.min || p > c.pci.max))
 				return { ok: false, error: `pci must be ${c.pci.min}-${c.pci.max}` };
 			return start_guard(`ACTION=cell\nCELL_ARFCN=${+a}\nCELL_PCI=${+p}\n` +
-			                   `CELL_LTE_ONLY=${req.args?.lte_only ? 1 : 0}\n` +
-			                   `PERSIST=${req.args?.persist ? 1 : 0}\n`);
+			                   `CELL_LTE_ONLY=${req.args?.lte_only ? 1 : 0}\n`);
 		}
 	},
 

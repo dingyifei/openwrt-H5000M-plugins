@@ -66,6 +66,16 @@ if [ -n "$wan_zone" ]; then
 	uci -q set "${wan_zone}.mtu_fix=1"
 fi
 
+# --- migration: drop radio options an older release wrote but nothing ever read ----
+# fm350-radio used to offer a "keep after reboot" flag that set network.cellular.rat/.bands/
+# .cell_arfcn/.cell_pci. No reader was ever written for them - not the dialer, not the proto
+# handler - and the modem persists its own band/RAT selection and cell lock regardless, so the
+# flag changed nothing in either position. The options are gone from the code; remove any an
+# upgraded device is still carrying, so they cannot be mistaken later for live configuration.
+for opt in rat bands cell_arfcn cell_pci; do
+	uci -q delete "network.cellular.${opt}"
+done
+
 uci -q commit network
 uci -q commit firewall
 
