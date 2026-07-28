@@ -413,10 +413,30 @@ function parse_gtact(line) {
 	const bands = [];
 	for (let i = 3; i < length(v); i++)
 		push(bands, v[i]);
+	// pref_label is what a view should DISPLAY, and it is not simply pref1 + pref2.
+	//
+	// The two preference slots are frequently identical - `+GTACT: 14,6,6,...` - partly because
+	// we put them there ourselves: when the modem reports an empty second preference (it emits
+	// `+GTACT: 14,6,` but refuses to accept one back), the guard's gtact_replayable() fills the
+	// gap from the RAT, and for a single-RAT mode both slots resolve to the same value. Rendering
+	// that as an ordered list produced "Preferred: NR > NR" on the Radio and Status pages - an
+	// ordering between a thing and itself, which reads as a bug even though the radio is fine.
+	//
+	// Collapsed HERE rather than in each view: two views were already joining these fields with
+	// the identical expression, so fixing it in one would have left the other still saying
+	// "NR > NR". The raw pref1/pref2 stay exposed for anything that needs the real values.
+	const p1 = gtact_pref_name(v[1] ?? -1);
+	const p2 = gtact_pref_name(v[2] ?? -1);
+	const parts = [];
+	for (let p in [ p1, p2 ])
+		if (p && !(p in parts))
+			push(parts, p);
+
 	return {
 		rat: v[0], rat_name: gtact_rat_name(v[0]),
-		pref1: v[1] ?? null, pref1_name: gtact_pref_name(v[1] ?? -1),
-		pref2: v[2] ?? null, pref2_name: gtact_pref_name(v[2] ?? -1),
+		pref1: v[1] ?? null, pref1_name: p1,
+		pref2: v[2] ?? null, pref2_name: p2,
+		pref_label: length(parts) ? join(' > ', parts) : null,
 		bands: bands
 	};
 }

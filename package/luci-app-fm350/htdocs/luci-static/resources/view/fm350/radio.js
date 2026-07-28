@@ -216,7 +216,10 @@ return view.extend({
 		dom.content(this.bandListBox, this.renderBandList());
 		this.bandNoteBox = E('div');
 		dom.content(this.bandNoteBox, this.renderBandNote());
-		var pref = [ this.ri.pref1_name, this.ri.pref2_name ].filter(function(x) { return x; }).join(' > ');
+		// pref_label is built by the backend, which collapses the duplicate the modem (and our
+		// own empty-preference fill) routinely produces - see parse_gtact. Joining the two raw
+		// name fields here is what rendered "Preferred: NR > NR".
+		var pref = this.ri.pref_label;
 
 		return [
 			rows(_('Current radio configuration'), [

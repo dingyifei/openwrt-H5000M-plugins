@@ -37,12 +37,26 @@ var callRadioInfo = rpc.declare({ object: 'luci.fm350', method: 'radio_info', ex
 // (4=LTE, 9=NR, 2=UMTS) which is a DIFFERENT numbering from cell_caps.rats (EMMCHLCK 0/2/7), so
 // they must not be compared directly. cell_set is an E-UTRAN lock (EARFCN+PCI, lte_only) with no
 // RAT parameter, so LTE is the only RAT it can actually pin.
-function lockReason(rat) {
+//
+// ⚠️ RAT is necessary but NOT sufficient. A neighbour row's ARFCN can be unusable as printed:
+// observed `2,4,,,FFFFFFF,00FFFFFFF,165084,188,...` — a genuine LTE neighbour (locking to it via
+// the carrier's real EARFCN worked) whose reported ARFCN of 165084 is above the modem's own
+// EMMCHLCK ceiling of 46589. Two other fields in that row were also out of their documented
+// ranges. Without the bounds check below the row renders a live Lock button whose only possible
+// outcome is the backend's "arfcn must be 0-46589" — an error the user cannot act on. Bounds
+// come from the modem's own AT+EMMCHLCK=? (radio_info.cell_caps), never hard-coded.
+function lockReason(rat, arfcn, caps) {
 	if (rat === 9)
 		return _('NR cell locking is not supported by this firmware');
 	if (rat === 2)
 		return _('Cell locking applies to LTE cells only on this modem');
-	return _('This cell type cannot be locked');
+	if (rat !== 4)
+		return _('This cell type cannot be locked');
+	var a = caps && caps.arfcn;
+	if (a && (arfcn === null || arfcn === undefined || arfcn < a.min || arfcn > a.max))
+		return _('The modem reports this cell\'s EARFCN as %s, outside the lockable range %d–%d, so it cannot be used as a lock target.')
+			.format(arfcn === null || arfcn === undefined ? '—' : arfcn, a.min, a.max);
+	return null;
 }
 
 // Same dash semantics as the status page: null/undefined/'' is a dash, never "undefined" or
@@ -152,14 +166,15 @@ return view.extend({
 	lockCell: function(c, serving, lockedRow) {
 		if (lockedRow)
 			return E('strong', {}, [ _('Locked') ]);
-		if (c.rat === 4)
+		var why = lockReason(c.rat, c.arfcn, this.cellCaps);
+		if (!why)
 			return E('button', {
 				'class': 'btn cbi-button-action',
 				'click': ui.createHandlerFn(this, 'handleLock', c.arfcn, c.pci, serving)
 			}, [ serving ? _('Pin to current cell') : _('Lock') ]);
 		return E('span', {}, [
 			E('button', { 'class': 'btn', 'disabled': 'disabled' }, [ _('Lock') ]), ' ',
-			E('span', { 'class': 'cbi-value-description' }, [ lockReason(c.rat) ])
+			E('span', { 'class': 'cbi-value-description' }, [ why ])
 		]);
 	},
 
@@ -187,6 +202,11 @@ return view.extend({
 		this.lockInfo = (ri && ri.cell_locked)
 			? { locked: true, arfcn: ri.cell_arfcn, pci: ri.cell_pci }
 			: { locked: false };
+		// The modem's own AT+EMMCHLCK=? bounds, kept alongside the lock state because both come
+		// from the same radio_info read and lockCell() needs them to decide whether a row's
+		// ARFCN is even submittable. Undefined caps mean "do not second-guess the modem": the
+		// bounds check in lockReason() is skipped and the backend still validates.
+		this.cellCaps = ri && ri.cell_caps;
 	},
 
 	// --- async scan handling ---------------------------------------------------------

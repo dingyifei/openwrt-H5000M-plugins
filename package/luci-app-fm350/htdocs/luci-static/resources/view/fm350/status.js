@@ -257,7 +257,9 @@ return view.extend({
 		// the band row is a separate, derived fact: whether the enabled set is the full
 		// capability, computed in bandSummary().
 		var bs = bandSummary(ri);
-		var pref = [ ri.pref1_name, ri.pref2_name ].filter(function(x) { return x; }).join(' > ');
+		// See parse_gtact: the backend collapses identical preferences, so this does not render
+		// "NR > NR" when both slots hold the same value.
+		var pref = ri.pref_label;
 		// A forgotten cell lock shows up later as unexplained bad signal, and Status is where
 		// people look first — so surface it here, compactly, whenever one is active.
 		var cellLockVal = ri.cell_locked
