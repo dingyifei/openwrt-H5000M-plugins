@@ -161,9 +161,17 @@ return view.extend({
 								: _('Deleting the message. The AT port is shared with the dialer keeping the uplink up, so this can briefly queue behind it.');
 						self.showBanner(waitMsg, 'info', true);
 
+						// ⚠️ NEVER pass null for a declared rpc param. ubus types each
+						// argument from the backend's `args` exemplar and REJECTS a null
+						// outright - "Invalid argument" - so the call never reaches the
+						// backend at all. That is exactly how this shipped broken: the
+						// delete silently never ran, the banner honestly reported "result
+						// unknown", and the message stayed in the list.
+						// Use type-appropriate empties instead. The backend returns early on
+						// origin=='archived', so index/indexes are never read on that path.
 						var call = archived
-							? callDelete(null, null, 'archived', m.id)
-							: callDelete(null, indexes, 'live', null);
+							? callDelete(0, '', 'archived', m.id)
+							: callDelete(0, indexes, 'live', '');
 
 						// The banner must survive until BOTH the RPC resolves AND the follow-up
 						// refresh lands, because the store count from sms_list is what actually

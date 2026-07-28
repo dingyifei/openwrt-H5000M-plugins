@@ -147,6 +147,24 @@ for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); 
 done
 [ "$_alias" -eq 0 ] && ok "dotted requires all name their alias"
 
+echo "== never pass null as a declared rpc argument =="
+# ubus types every argument from the backend's `args` exemplar and REJECTS a null with
+# "Invalid argument" - the call never reaches the backend. Shipped exactly that way:
+# `callDelete(null, indexes, 'live', null)` meant SMS delete silently never ran. The banner
+# correctly reported "result unknown" (it was), the message stayed in the list, and nothing
+# anywhere said why. Neither `node --check` nor any rendering test can see it.
+# Use a type-appropriate empty - 0 for an integer, '' for a string - instead.
+_rpcnull=0
+for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); do
+	# [^)]* so the match cannot run past the call's own closing paren: a legitimate
+	# `L.resolveDefault(callX(), null)` passes null to resolveDefault, not to the RPC.
+	if grep -qE 'call[A-Z][A-Za-z]*\([^)]*\bnull\b' "$f"; then
+		bad "$(basename "$f") passes null to an rpc call"
+		_rpcnull=1
+	fi
+done
+[ "$_rpcnull" -eq 0 ] && ok "no null rpc arguments"
+
 echo "== uci-defaults must not create anonymous wireless sections =="
 # `uci add wireless wifi-iface` yields an anonymous section, which is precisely what LuCI's
 # wireless-migration prompt exists to rewrite - and it restarts the network to do it. Name
