@@ -231,6 +231,27 @@ for mk in $(find "$PKGDIR" -maxdepth 2 -name Makefile -path '*luci-app-*' | sort
 	fi
 done
 
+echo "== rpcd backends only write UCI configs their own ACL actually grants =="
+# A write that lands `uci ... set <config>.*` but was never added to write.uci in the same
+# package's ACL file fails SILENTLY for any session other than root's full-trust one - it
+# looks like it works when tested as root, then quietly does nothing for a restricted
+# session. Caught for real while wiring up the SMS archive settings page: archive_set landed
+# `uci set h5000m.sms_archive.*` a commit before the ACL was extended to grant write.uci for
+# "h5000m" at all - only h5000m-ttl was listed.
+for f in $(find "$PKGDIR" -type f -path '*/rpcd/ucode/*' | sort); do
+	pkgdir="${f%/root/usr/share/rpcd/ucode/*}"
+	acls=$(find "$pkgdir/root/usr/share/rpcd/acl.d" -type f -name '*.json' 2>/dev/null)
+	configs=$(code_of "$f" | grep -oE "uci[^\"']*set[[:space:]]+[A-Za-z0-9_-]+\." \
+	          | sed -E 's/.*set[[:space:]]+//; s/\.$//' | sort -u)
+	for cfg in $configs; do
+		if [ -n "$acls" ] && grep -q "\"$cfg\"" $acls 2>/dev/null; then
+			ok "$(basename "$f") writes uci '$cfg', granted in its ACL"
+		else
+			bad "$(basename "$f") writes uci '$cfg' but no ACL grants write.uci for it"
+		fi
+	done
+done
+
 echo "== procd respawn, where used, takes three numeric args =="
 # procd_set_param respawn <threshold> <timeout> <retry>; a wrong arg count silently changes the
 # respawn behaviour and shows up only as a service that does not come back after a crash. NOT

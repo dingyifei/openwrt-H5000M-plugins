@@ -32,8 +32,12 @@ config logging 'logging'
 	# The router-side SMS FIFO archiver (h5000m-sms-archive). Read once at process start,
 	# like the others - changing it needs `/etc/init.d/h5000m-sms-archive restart`.
 	option sms_archive ''
-	# The LuCI backend. It logs through the same library as everything else - a new
-	# component must not be the one thing that bypasses it.
+	# The LuCI backend (luci.fm350). NOT the full library above - that is POSIX shell
+	# (log.sh) and this backend is ucode, so it cannot be sourced there. `ui` gets a
+	# narrower, deliberate subset: the same error/warn/info/debug/trace level gate, via
+	# plain `logger` calls, but no redaction and no dedup. That is fine here because this
+	# component only ever logs small integers/booleans (archiver settings changes) or a
+	# fixed parse-failure notice - never SMS bodies or numbers, so there is nothing to mask.
 	option ui ''
 	# Identifier masking. AT traffic carries IMSI, ICCID, EID, phone numbers and whole SMS
 	# bodies; syslog can be forwarded off-box. Applies at EVERY level, not just trace -

@@ -10,12 +10,19 @@
 # take effect on the NEXT cycle with no restart. Only the log LEVEL is read once at start (that
 # is log.sh's documented behaviour, shared with the dialer); changing h5000m.logging.sms_archive
 # needs `/etc/init.d/h5000m-sms-archive restart`.
+#
+# Also drops a small status file in /var/run (tmpfs - ephemeral by design, this is NOT the
+# durable archive) after every cycle it actually runs, so the LuCI settings page can show "when
+# did this last run and what happened" via archive_get without grepping logread. Written only
+# when ENABLED=1 actually ran a cycle - a disabled archiver leaves whatever the last real run
+# left behind, which is the correct "nothing has happened since" signal.
 
 # shellcheck disable=SC1091
 . /usr/lib/h5000m/log.sh
 h5000m_log_init sms_archive
 
 WORKER=/usr/sbin/h5000m-sms-archive-worker
+STATUS_FILE=/var/run/h5000m-sms-archive.status
 _fails=0
 
 log_info "SMS archiver started"
@@ -34,16 +41,33 @@ while :; do
 		# AT_PRIO=5: below every user action, above the cosmetic status poll. h5000m-sms keeps
 		# an already-set AT_PRIO, so recv/delete inside the worker inherit this tier.
 		export AT_PRIO=5
+		# A DISPLAY timestamp for the settings page, not a deadline - nothing here compares it
+		# against a later `date` call. That distinction matters: this board has no RTC and NTP
+		# steps the clock forward once the network is up, which is exactly what makes
+		# date-derived DEADLINES unsafe elsewhere in this codebase. A one-shot capture for
+		# "when did this last run" has no such hazard - it just occasionally reads as the image
+		# build date until NTP corrects it, a cosmetic detail, not a bug.
+		_ts="$(date '+%Y-%m-%d %H:%M:%S')"
 		if _out="$("$WORKER" 2>&1)"; then
 			_fails=0
 			[ -n "$_out" ] && log_info "$_out"
+			_result=ok
 		else
 			_fails=$((_fails + 1))
 			log_warn "archive cycle failed: ${_out:-unknown error}"
 			# Escalate ONCE at a run of failures so a persistent fault is visible without
 			# flooding the log every interval.
 			[ "$_fails" = 5 ] && log_error "archive cycle has failed 5 times in a row; still retrying every ${INTERVAL}s"
+			_result=fail
 		fi
+		# tr collapses to one line: a crash could leave a multi-line ucode stack trace in
+		# $_out, and the reader side parses this with a simple "name equals value" match
+		# per line.
+		{
+			printf 'last_run=%s\n' "$_ts"
+			printf 'last_result=%s\n' "$_result"
+			printf 'last_summary=%s\n' "$(printf '%s' "${_out:-no output}" | tr '\n' ' ')"
+		} > "$STATUS_FILE" 2>/dev/null
 	fi
 
 	# Backgrounded sleep + wait so a procd SIGTERM interrupts the wait promptly, the same idiom

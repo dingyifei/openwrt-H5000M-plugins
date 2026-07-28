@@ -16,7 +16,7 @@ violation and confirming the suite fails. That habit exists because this repo ha
 test that passed vacuously: it compared two empty files, because `uci show` with multiple
 arguments writes nothing.
 
-## `test-plugin-invariants.sh` — 47 static checks
+## `test-plugin-invariants.sh` — 49 static checks
 
 Every rule exists because the corresponding mistake was actually made, not as hypothetical
 hygiene:
@@ -44,7 +44,11 @@ hygiene:
 - shared ucode libraries under `usr/share/ucode/` take no direct `/dev/tty` access, same ban as
   the rpcd backends but a separate check (a pure library has no `AT_PRIO` to set);
 - every `/lib/upgrade/keep.d/*` entry is an absolute path and never under `/tmp` or `/var`
-  (tmpfs, wiped each boot) — the one property the SMS archive's persistence depends on.
+  (tmpfs, wiped each boot) — the one property the SMS archive's persistence depends on;
+- every UCI config an rpcd backend `uci set`s must appear in that package's own ACL
+  `write.uci` — otherwise the write fails silently for any session but root's full-trust
+  one. Caught for real: `archive_set` landed a `uci set h5000m.sms_archive.*` call a commit
+  before the ACL was extended to grant `h5000m` at all.
 
 The shell-syntax check skips files whose shebang is `ucode`: they are not POSIX sh, and `sh -n`
 would reject valid ucode. Their syntax is exercised on-target instead.
