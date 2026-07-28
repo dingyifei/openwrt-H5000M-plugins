@@ -71,7 +71,20 @@ function cached(key, ttl, volatile, producer) {
 	if (e && (now - e.at) < ttl && e.gen == gen)
 		return { data: e.data, age: now - e.at, cached: true };
 	const data = producer();
-	cache[key] = { at: now, gen: gen, data: data };
+	// ⛔ NEVER CACHE A FAILED READ. `null` here always means "the modem did not answer",
+	// never a real value - and the capability entries use a 24 HOUR ttl, so storing one
+	// failure disabled the Radio page for a day.
+	//
+	// Measured immediately after a flash: the first page load raced the modem still
+	// enumerating, AT+GTACT=? and AT+EMMCHLCK=? both returned nothing, and the nulls were
+	// cached. The page then showed "No band capability reported", an empty mode selector and
+	// "range unavailable" for EARFCN/PCI - with the modem perfectly healthy and registered.
+	// It reads exactly like a code regression, which is why it cost real time to find.
+	//
+	// Skipping the store means the next call simply retries; a caller that legitimately has
+	// nothing to report returns an empty object or a zero, not null.
+	if (data != null)
+		cache[key] = { at: now, gen: gen, data: data };
 	return { data: data, age: 0, cached: false };
 }
 
@@ -929,8 +942,13 @@ const methods = {
 					if (c && l)
 						run(`printf '%s' ${shq(l)} > /var/run/fm350-gtact-caps 2>/dev/null`);
 				}
-				return c ?? { rats: [], umts: [], lte: [], nr: [] };
-			});
+				// ⛔ Return null, NOT an empty shape, when the read failed. The empty
+				// `{ rats: [], ... }` fallback used to be returned here - and cached, for a
+				// day, as though the radio genuinely had no bands. The caller substitutes the
+				// empty shape below, so the response is unchanged; the difference is only that
+				// a failure is no longer remembered as an answer.
+				return c;
+			}).data ?? { rats: [], umts: [], lte: [], nr: [] };
 
 			// Labels are derived here rather than in the view so the encoding rule lives in
 			// exactly one place.
@@ -945,7 +963,7 @@ const methods = {
 			// one the moment either is extended - silently, since a wrong mode name still
 			// renders. One source, shipped as {value,label} like the bands already are.
 			const rat_opts = [];
-			for (let r in (caps.data.rats ?? []))
+			for (let r in (caps.rats ?? []))
 				push(rat_opts, { value: r, label: gtact_rat_name(r) });
 
 
@@ -954,9 +972,9 @@ const methods = {
 				cell_caps: cell_caps(),
 				band_labels: label(cfg.data?.bands ?? []),
 				caps: {
-					rats: caps.data.rats,
+					rats: caps.rats,
 					rat_options: rat_opts,
-					bands: label([ ...caps.data.umts, ...caps.data.lte, ...caps.data.nr ])
+					bands: label([ ...caps.umts, ...caps.lte, ...caps.nr ])
 				},
 				cached: cfg.cached, age: cfg.age
 			};

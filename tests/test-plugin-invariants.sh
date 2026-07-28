@@ -393,6 +393,25 @@ for f in $(find "$PKGDIR/luci-app-fm350" -name '*.js' | sort); do
 done
 [ "$_promise" -eq 0 ] && ok "no UI text claims a reboot clears a radio lock"
 
+echo "== a cached() producer's failure must not be stored =="
+# cached() memoises by key, and the capability entries use a 24 HOUR ttl. Storing a FAILED read
+# therefore disables a page for a day. Measured right after a flash: the first page load raced
+# the modem still enumerating, AT+GTACT=? and AT+EMMCHLCK=? returned nothing, and the empty
+# results were cached - the Radio page showed "No band capability reported", an empty mode
+# selector and "range unavailable", with the modem healthy and registered. It presents exactly
+# as a code regression, which is what makes it expensive.
+#
+# The guard is one line in cached() and this asserts it stays there; a null-returning producer
+# is then simply retried on the next call.
+for f in $(find "$PKGDIR" -type f -path '*/rpcd/ucode/*' | sort); do
+	grep -q 'function cached(' "$f" || continue
+	if jscode_of "$f" | grep -A 4 'const data = producer();' | grep -q 'if (data != null)'; then
+		ok "$(basename "$f") does not cache a failed read"
+	else
+		bad "$(basename "$f") caches whatever producer() returns, including a failure"
+	fi
+done
+
 echo
 echo "checks=${checks} failures=${fails}"
 [ "$fails" -eq 0 ] || exit 1
