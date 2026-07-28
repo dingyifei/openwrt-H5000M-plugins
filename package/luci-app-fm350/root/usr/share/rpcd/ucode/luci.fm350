@@ -670,22 +670,92 @@ function group_messages(msgs) { return grouping.group_messages(msgs); }
 // needs to log something sensitive, it must NOT go through this helper unmodified.
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 };
 
+// ⚠️ A LEVEL NAME IS NOT ALWAYS A SYSLOG PRIORITY. LOG_LEVELS admits `trace` and `warn`;
+// syslog has neither `daemon.trace` nor, on some implementations, `daemon.warn` as spelled.
+// log.sh carries an explicit name->priority table for exactly this reason, and the first
+// version of this function copied the ordinal gate but not the mapping - so a future
+// ui_log('trace', …) would have been dropped by logger with 2>/dev/null hiding why.
+function syslog_prio(level) {
+	switch (level) {
+	case 'error': return 'err';
+	case 'warn':  return 'warning';
+	case 'info':  return 'info';
+	default:      return 'debug';
+	}
+}
+
 function ui_log(level, msg) {
-	const comp = trim(run('uci -q get h5000m.logging.ui 2>/dev/null') ?? '');
-	const glob = trim(run('uci -q get h5000m.logging.level 2>/dev/null') ?? '');
-	const want = LOG_LEVELS[(comp != '') ? comp : ((glob != '') ? glob : 'info')] ?? LOG_LEVELS.info;
+	// Cached: two forks to decide whether to emit, paid even when the line is then suppressed,
+	// on a value that changes about never. 300s is far shorter than the interval at which
+	// anyone edits a log level, and this is the primitive every future backend log line will
+	// route through.
+	const want = cached('ui_loglevel', 300, false, function() {
+		const u = uci_section('h5000m.logging');
+		const name = (u.ui ?? '') != '' ? u.ui : (((u.level ?? '') != '') ? u.level : 'info');
+		return LOG_LEVELS[name] ?? LOG_LEVELS.info;
+	}).data;
 	if ((LOG_LEVELS[level] ?? LOG_LEVELS.info) > want)
 		return;
-	run(`logger -t fm350-ui -p daemon.${level} ${shq(msg)} 2>/dev/null`);
+	run(`logger -t fm350-ui -p daemon.${syslog_prio(level)} ${shq(msg)} 2>/dev/null`);
 }
 
 // Single source for the modem store's used/total counters - sms_list and archive_get both
 // need them, and a second copy of this regex would be exactly the kind of drift this file's
 // own comments elsewhere warn about.
+// ⚠️ THIS TAKES THE SHARED AT-PORT LEASE, and rpcd is SINGLE-THREADED - while it runs, every
+// LuCI page is frozen, not just this one. h5000m-sms defaults to AT_PRIO=20 (the user tier,
+// above the archiver and the cell collector), AT_LEASE_WAIT=30 and H5000M_SMS_TIMEOUT=45, so
+// left alone a single page load could block rpcd for ~75s. That contradicts this file's own
+// header rule - lowest tier, short waits, contention surfaces as "modem busy" rather than a
+// hung page - which the original call simply did not apply. All three are env-overridable.
+//
+// Cached because two callers (sms_list and archive_get) want the same number and the store
+// count moves slowly; 15s also collapses the re-read that follows an Apply. Volatile so the
+// guard changing radio state still invalidates it.
 function sms_status() {
-	const s = run('/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
-	const m = match(s, /used:\s*(\d+),\s*total:\s*(\d+)/);
-	return { used: m ? +m[1] : null, total: m ? +m[2] : null };
+	return cached('sms_status', 15, true, function() {
+		const s = run('AT_PRIO=1 AT_LEASE_WAIT=3 H5000M_SMS_TIMEOUT=10 ' +
+		              '/usr/sbin/h5000m-sms status 2>/dev/null') ?? '';
+		const m = match(s, /used:\s*(\d+),\s*total:\s*(\d+)/);
+		return { used: m ? +m[1] : null, total: m ? +m[2] : null };
+	}).data;
+}
+
+// One `uci show <section>` instead of one `uci -q get` fork per option. Each run() is a popen
+// plus a /bin/sh plus a uci - reading five options cost ten processes on a ~1 GHz MIPS board.
+// log.sh documents the identical fix on the shell side ("four forks each turned into 28").
+// Returns {} for a missing section, so callers' defaults still apply.
+function uci_section(path) {
+	const out = run(`uci -q show ${path} 2>/dev/null`) ?? '';
+	const vals = {};
+	for (let line in split(out, '\n')) {
+		// uci show emits `cfg.section.option='value'`. Capture the value WHOLE and strip the
+		// quotes afterwards - an optional `'?` against a non-greedy `(.*?)` lets the closing
+		// quote fall inside the capture instead, which shipped as `interface: "cellular'"` and
+		// turned every numeric option into NaN.
+		const m = match(trim(line), /^[^=]*\.([^.=]+)=(.*)$/);
+		if (!m)
+			continue;
+		let v = m[2];
+		if (length(v) > 1 && substr(v, 0, 1) == "'" && substr(v, -1) == "'")
+			v = substr(v, 1, length(v) - 2);
+		vals[m[1]] = v;
+	}
+	return vals;
+}
+
+// Count archived messages WITHOUT rebuilding them. read_archive() allocates an 11-field object
+// per message to reshape it for the inbox merge; archive_get only ever called length() on the
+// result, and max_messages defaults to 0 (unbounded), so N is user-controlled.
+function archive_count() {
+	const raw = readfile(SMS_ARCHIVE);
+	if (!raw)
+		return 0;
+	try {
+		return length(json(raw)?.messages ?? []);
+	} catch (e) {
+		return 0;
+	}
 }
 
 // True only if procd reports a LIVE instance. The service is always started at boot
@@ -1009,7 +1079,7 @@ const methods = {
 		call: function() {
 			// An empty ARFCN is the guard's unlock signal; it also puts back any RAT
 			// narrowing the lock applied.
-			return start_guard('ACTION=cell\nCELL_ARFCN=\nCELL_PCI=\nCELL_LTE_ONLY=0\nPERSIST=0\n');
+			return start_guard('ACTION=cell\nCELL_ARFCN=\nCELL_PCI=\nCELL_LTE_ONLY=0\n');
 		}
 	},
 
@@ -1017,7 +1087,7 @@ const methods = {
 		call: function() {
 			// RAT 10 is the modem's own "automatic"; with no band list it clears the lock
 			// for every RAT at once.
-			return start_guard('ACTION=band\nRAT=10\nBANDS=""\nPERSIST=0\n');
+			return start_guard('ACTION=band\nRAT=10\nBANDS=""\n');
 		}
 	},
 
@@ -1042,16 +1112,15 @@ const methods = {
 	// this only reads its UCI and runs the apply helper, so the nft generation has ONE owner.
 	ttl_get: {
 		call: function() {
-			const g = function(o, d) {
-				const v = trim(run(`uci -q get h5000m-ttl.settings.${o} 2>/dev/null`) ?? '');
-				return v != '' ? v : d;
-			};
+			const c = uci_section('h5000m-ttl.settings');
+			const g = function(o, d) { return (c[o] ?? '') != '' ? c[o] : d; };
 			// Reported so the UI can state the real consequence rather than a generic warning:
 			// offloaded flows never traverse postrouting, so with offloading on only a flow's
 			// first packets get rewritten - a mix of 64 and 63 fingerprints tethering just as
 			// well as no rewrite at all.
-			const off = trim(run("uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null") ?? '');
-			const offhw = trim(run("uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null") ?? '');
+			const fw = uci_section('firewall.@defaults[0]');
+			const off = fw.flow_offloading ?? '';
+			const offhw = fw.flow_offloading_hw ?? '';
 			return {
 				installed: !!stat('/usr/libexec/h5000m-ttl-apply'),
 				enabled: g('enabled', '0') == '1',
@@ -1218,25 +1287,35 @@ const methods = {
 	// has no second round trip).
 	archive_get: {
 		call: function() {
-			const g = function(o, d) {
-				const v = trim(run(`uci -q get h5000m.sms_archive.${o} 2>/dev/null`) ?? '');
-				return v != '' ? v : d;
-			};
-			const st = sms_status();
+			// ⚠️ INSTALLED FIRST, BEFORE ANY WORK. The package is EXTRA_DEPENDS, so "absent" is
+			// the ORDINARY case, and the view discards every other field when installed is
+			// false. Building the full response first meant a device without the archiver still
+			// paid a real modem AT transaction plus a pile of forks to open this page, all of it
+			// thrown away.
+			//
+			// The worker binary, not the init script: this is "can it actually do anything",
+			// the same intent as ttl_get's `installed` check.
+			if (!stat('/usr/sbin/h5000m-sms-archive-worker'))
+				return { installed: false };
+
+			const c = uci_section('h5000m.sms_archive');
+			const g = function(o, d) { return (c[o] ?? '') != '' ? c[o] : d; };
 			const stf = archive_status_file();
 			return {
-				// The worker binary, not the init script: this is "can it actually do
-				// anything", the same intent as ttl_get's `installed` check.
-				installed: !!stat('/usr/sbin/h5000m-sms-archive-worker'),
+				installed: true,
 				running: archive_running(),
 				enabled: g('enabled', '0') == '1',
 				threshold: +g('threshold', '70'),
 				batch_size: +g('batch_size', '10'),
 				interval: +g('interval', '900'),
 				max_messages: +g('max_messages', '0'),
-				storage_path: g('storage_path', '/etc/h5000m/sms-archive.json'),
-				archived_count: length(read_archive()),
-				used: st.used, total: st.total,
+				// storage_path is deliberately NOT returned. read_archive() reads the SMS_ARCHIVE
+				// constant and ignores UCI, so reporting the UCI value would advertise a setting
+				// the backend does not honour - a field that starts lying the moment anyone edits
+				// it. No consumer read it.
+				archived_count: archive_count(),
+				// Cheap now: sms_status() is cached and runs at the lowest AT tier.
+				used: sms_status().used, total: sms_status().total,
 				last_run: stf.last_run,
 				last_result: stf.last_result,
 				last_summary: stf.last_summary
@@ -1253,12 +1332,14 @@ const methods = {
 		args: { enabled: 0, threshold: 0, batch_size: 0, interval: 0, max_messages: 0 },
 		call: function(req) {
 			const a = req.args ?? {};
+			// Kept NUMERIC through validation and stringified only at the uci write below. The
+			// first version coerced to string here and back with `+` twice per bound check.
 			const fields = {
-				enabled:      (a.enabled ? 1 : 0) + '',
-				threshold:    ('' + (+(a.threshold ?? 70))),
-				batch_size:   ('' + (+(a.batch_size ?? 10))),
-				interval:     ('' + (+(a.interval ?? 900))),
-				max_messages: ('' + (+(a.max_messages ?? 0)))
+				enabled:      a.enabled ? 1 : 0,
+				threshold:    +(a.threshold ?? 70),
+				batch_size:   +(a.batch_size ?? 10),
+				interval:     +(a.interval ?? 900),
+				max_messages: +(a.max_messages ?? 0)
 			};
 
 			// Bounds: threshold/batch_size against the modem's realistic slot range (ME
@@ -1266,37 +1347,45 @@ const methods = {
 			// interval floors at 60s to match the driver's own floor, so a value rejected
 			// here is never silently re-floored later without the caller knowing; 0 is a
 			// valid, deliberate max_messages meaning "unbounded" (the shipped default).
-			if (+fields.threshold < 1 || +fields.threshold > 500) {
-				ui_log('warn', `sms_archive: rejected threshold=${fields.threshold} (must be 1-500)`);
-				return { ok: false, error: 'threshold must be 1-500' };
-			}
-			if (+fields.batch_size < 1 || +fields.batch_size > 100) {
-				ui_log('warn', `sms_archive: rejected batch_size=${fields.batch_size} (must be 1-100)`);
-				return { ok: false, error: 'batch_size must be 1-100' };
-			}
-			if (+fields.interval < 60 || +fields.interval > 86400) {
-				ui_log('warn', `sms_archive: rejected interval=${fields.interval} (must be 60-86400)`);
-				return { ok: false, error: 'interval must be 60-86400 seconds' };
-			}
-			if (+fields.max_messages < 0 || +fields.max_messages > 100000) {
-				ui_log('warn', `sms_archive: rejected max_messages=${fields.max_messages} (must be 0-100000)`);
-				return { ok: false, error: 'max_messages must be 0 (unbounded) to 100000' };
+			//
+			// Table-driven because four hand-written blocks differing only in name/min/max is
+			// how one of them ends up with the wrong bound or a message that disagrees with the
+			// test it guards. The message is DERIVED from the same numbers it checks.
+			const BOUNDS = [
+				[ 'threshold',    1,  500,    'threshold must be 1-500' ],
+				[ 'batch_size',   1,  100,    'batch_size must be 1-100' ],
+				[ 'interval',     60, 86400,  'interval must be 60-86400 seconds' ],
+				[ 'max_messages', 0,  100000, 'max_messages must be 0 (unbounded) to 100000' ]
+			];
+			for (let b in BOUNDS) {
+				const v = fields[b[0]];
+				if (v < b[1] || v > b[2]) {
+					ui_log('warn', `sms_archive: rejected ${b[0]}=${v} (must be ${b[1]}-${b[2]})`);
+					return { ok: false, error: b[3] };
+				}
 			}
 
 			// Audit trail: this is the one write path that can turn on automatic message
 			// deletion, so log exactly what changed - not just that "settings were saved".
 			// Read-before-write rather than trusting the caller's own request, since a
 			// no-op save (identical values re-submitted) should not spam syslog.
+			// ONE `uci show` for the read-back, then ONE shell for every set plus the commit.
+			// Previously this was up to eleven popens - five gets, five sets and a commit - each
+			// costing a /bin/sh AND a uci, so ~22 processes for one Apply on a ~1 GHz board.
+			const cur = uci_section('h5000m.sms_archive');
 			const changed = [];
+			let sets = '';
 			for (let k in fields) {
-				const old = trim(run(`uci -q get h5000m.sms_archive.${k} 2>/dev/null`) ?? '');
-				if (old != fields[k]) {
-					push(changed, `${k} ${old || '(unset)'}->${fields[k]}`);
-					run(`uci -q set h5000m.sms_archive.${k}=${shq(fields[k])}`);
+				const old = cur[k] ?? '';
+				// fields[k] is numeric; compare as strings because uci always reports strings.
+				const val = '' + fields[k];
+				if (old != val) {
+					push(changed, `${k} ${old || '(unset)'}->${val}`);
+					sets += `uci -q set h5000m.sms_archive.${k}=${shq(val)}; `;
 				}
 			}
 			if (length(changed)) {
-				run('uci -q commit h5000m');
+				run(sets + 'uci -q commit h5000m');
 				ui_log('info', `sms_archive settings changed: ${join(', ', changed)}`);
 			}
 			return { ok: true, changed: length(changed) };

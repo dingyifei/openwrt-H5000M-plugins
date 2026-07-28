@@ -104,7 +104,7 @@ return view.extend({
 				// router-side count is visible from the page it actually affects, without a
 				// second trip to the Archive settings page just to see whether it is doing
 				// anything.
-				(d.archived_count !== null && d.archived_count !== undefined)
+				d.archived_count
 					? E('span', {}, [ ' ' + _('%d message(s) held in the router\'s SMS archive.').format(d.archived_count) ])
 					: ''
 			]);

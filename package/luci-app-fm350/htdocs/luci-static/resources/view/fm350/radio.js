@@ -240,10 +240,7 @@ return view.extend({
 				// after a real reboot with nothing in uci the modem still reported the
 				// narrowed +GTACT. The modem stores this itself; the checkbox changed
 				// nothing either way. Say what actually happens instead.
-				E('p', { 'class': 'cbi-value-description' }, [
-					E('strong', {}, [ _('A band lock survives a reboot.') ]), ' ',
-					_('The modem stores it, so restarting the router will not undo it — use “Unlock (automatic)” for that. If the chosen bands cannot carry data, the router puts the previous configuration back on its own within about 90 seconds.')
-				]),
+	progress.persistenceNote(),
 				E('div', { 'class': 'right' }, [
 					E('button', { 'class': 'btn cbi-button-action important',
 						'click': ui.createHandlerFn(this, 'handleApply') }, [ _('Apply band lock') ]), ' ',
@@ -261,9 +258,11 @@ return view.extend({
 		var bands = this.collectBands();
 
 		var body = progress.outageWarning();
-		body.push(E('p', {}, [
-			E('strong', {}, [ _('This survives a reboot.') ]), ' ',
-			_('Undo it with “Unlock (automatic)” — note that unlock enables every band the radio supports, which is wider than whatever you had before.')
+		body.push(progress.persistenceNote());
+		// Band-lock specific, so it stays here rather than in the shared note: unlock does not
+		// restore what you had, it widens to every band the radio supports.
+		body.push(E('p', { 'class': 'cbi-value-description' }, [
+			_('Note that “Unlock (automatic)” enables every band the radio supports, which is wider than whatever you had before.')
 		]));
 		body.push(E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',

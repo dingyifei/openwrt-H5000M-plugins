@@ -61,21 +61,25 @@ return view.extend({
 		this.enableEl = E('input', { 'type': 'checkbox', 'class': 'cbi-input-checkbox' });
 		if (d.enabled) this.enableEl.checked = true;
 
+		// Values come straight from archive_get, which substitutes its own defaults and always
+		// returns numbers - and renderContent has already returned on !d.installed. The
+		// null/undefined guards that used to wrap each of these were unreachable (and would not
+		// have caught NaN anyway); keeping them implied a contract the backend does not have.
 		this.thresholdEl = E('input', {
 			'type': 'number', 'class': 'cbi-input-text', 'style': 'width:6em',
-			'value': (d.threshold === null || d.threshold === undefined) ? 70 : d.threshold
+			'value': d.threshold
 		});
 		this.batchEl = E('input', {
 			'type': 'number', 'class': 'cbi-input-text', 'style': 'width:6em',
-			'value': (d.batch_size === null || d.batch_size === undefined) ? 10 : d.batch_size
+			'value': d.batch_size
 		});
 		this.intervalEl = E('input', {
 			'type': 'number', 'class': 'cbi-input-text', 'style': 'width:6em',
-			'value': (d.interval === null || d.interval === undefined) ? 900 : d.interval
+			'value': d.interval
 		});
 		this.maxEl = E('input', {
 			'type': 'number', 'class': 'cbi-input-text', 'style': 'width:6em',
-			'value': (d.max_messages === null || d.max_messages === undefined) ? 0 : d.max_messages
+			'value': d.max_messages
 		});
 
 		var controls = E('div', { 'class': 'cbi-section' }, [

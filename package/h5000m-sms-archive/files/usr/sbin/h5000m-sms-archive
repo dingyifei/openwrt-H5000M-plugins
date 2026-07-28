@@ -63,11 +63,20 @@ while :; do
 		# tr collapses to one line: a crash could leave a multi-line ucode stack trace in
 		# $_out, and the reader side parses this with a simple "name equals value" match
 		# per line.
+		#
+		# ⚠️ Written to a temp file then RENAMED, never straight to $STATUS_FILE. The reader
+		# (luci.fm350's archive_status_file) takes no lock, so a page load landing mid-write
+		# would otherwise see a truncated file and render a garbled "Last cycle" row. rename is
+		# atomic within a filesystem, so a reader sees either the old contents or the new, never
+		# a mix. Every other producer/consumer pair here already does this - fm350-radio's say(),
+		# fm350-collect-cells, save_archive - and this was the only one that did not.
 		{
 			printf 'last_run=%s\n' "$_ts"
 			printf 'last_result=%s\n' "$_result"
 			printf 'last_summary=%s\n' "$(printf '%s' "${_out:-no output}" | tr '\n' ' ')"
-		} > "$STATUS_FILE" 2>/dev/null
+		} > "${STATUS_FILE}.$$" 2>/dev/null &&
+			mv -f "${STATUS_FILE}.$$" "$STATUS_FILE" 2>/dev/null
+		rm -f "${STATUS_FILE}.$$" 2>/dev/null
 	fi
 
 	# Backgrounded sleep + wait so a procd SIGTERM interrupts the wait promptly, the same idiom

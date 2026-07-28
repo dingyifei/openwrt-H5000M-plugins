@@ -12,8 +12,10 @@
 //    on every page is cheap and lets an apply STARTED on one page — e.g. a Lock pressed on the
 //    Cells list — stay visible if the user navigates away to Status or Radio.
 //  - It owns the ONE lock/unlock UX, so the outage warning, the default-on "restrict to LTE"
-//    note and the default-off "keep after reboot" rationale live in exactly one place instead of
-//    drifting across three copies — the same single-sourcing that keeps ratName honest.
+//    note and the "this survives a reboot" warning live in exactly one place instead of drifting
+//    across three copies — the same single-sourcing that keeps ratName honest. (The header used
+//    to advertise a "keep after reboot" rationale; that option was removed once the lock was
+//    measured to persist regardless, so there is nothing to opt into.)
 //  - Because a failed poll almost always means the very link this page rode in on is mid-retune,
 //    a null result is rendered as "still working", never as an error.
 
@@ -36,6 +38,19 @@ function stateLabel(s) {
 	case 'confirm':   return _('Awaiting confirmation');
 	default:          return s || _('Working…');
 	}
+}
+
+// The single owner of "this does not go away by itself".
+//
+// ⚠️ Kept HERE, beside outageWarning, because the claim it replaces was wrong in THREE separate
+// translatable strings at once ("clears on the next reboot", "your guaranteed way out"), and the
+// invariant that now polices that wording greps text. Three copies of a sentence a grep-based
+// check enforces is how the next correction lands in two files and misses the third.
+function persistenceNote() {
+	return E('p', { 'class': 'cbi-value-description' }, [
+		E('strong', {}, [ _('This survives a reboot.') ]), ' ',
+		_('The modem stores it itself, so restarting the router will not clear it — use Unlock to undo it. LuCI is reachable over the LAN even when the cellular link is down, so Unlock stays available. If the setting cannot carry data at all, the router rolls it back on its own within about 90 seconds.')
+	]);
 }
 
 // Every apply/unlock confirm reuses this — the link genuinely drops, so say so once, here.
@@ -179,12 +194,8 @@ Progress.prototype.lock = function(arfcn, pci, opts) {
 	// after a genuine reboot with nothing written to uci, the modem still reported the cell
 	// lock AND the narrowed band configuration. The escape hatch never existed, and saying it
 	// did is worse than saying nothing - it invites rebooting instead of unlocking, which
-	// leaves the user exactly as stuck but more confused. Tell the truth and point at the
-	// control that does work.
-	body.push(E('p', { 'class': 'cbi-value-description' }, [
-		E('strong', {}, [ _('This lock survives a reboot.') ]), ' ',
-		_('The modem stores it itself, so restarting the router will not clear it — use Unlock here to undo it. LuCI is reachable over LAN even when the cellular link is down, so Unlock stays available. If the lock cannot carry data at all, the router rolls it back on its own within about 90 seconds.')
-	]));
+	// leaves the user exactly as stuck but more confused.
+	body.push(persistenceNote());
 	body.push(E('div', { 'class': 'right' }, [
 		E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
 		E('button', { 'class': 'btn cbi-button-action important',
@@ -239,5 +250,6 @@ Progress.prototype.unlock = function() {
 // now covers every module under luci-static/resources, not just protocol handlers.
 return L.Class.extend({
 	create: function(node) { return new Progress(node); },
-	outageWarning: outageWarning
+	outageWarning: outageWarning,
+	persistenceNote: persistenceNote
 });

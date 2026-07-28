@@ -167,7 +167,10 @@ _rpcnull=0
 for f in $(find "$PKGDIR" -type f -path '*/luci-static/resources/*.js' | sort); do
 	# [^)]* so the match cannot run past the call's own closing paren: a legitimate
 	# `L.resolveDefault(callX(), null)` passes null to resolveDefault, not to the RPC.
-	if grep -qE 'call[A-Z][A-Za-z]*\([^)]*\bnull\b' "$f"; then
+	# jscode_of, not raw grep: this check greps for a CODE SHAPE that the commit fixing it
+	# invariably quotes in a comment ("was: callDelete(null, ...)"), which is the documentation
+	# style used throughout this repo. A check defeated by its own fix is worse than no check.
+	if jscode_of "$f" | grep -qE 'call[A-Z][A-Za-z]*\([^)]*\bnull\b'; then
 		bad "$(basename "$f") passes null to an rpc call"
 		_rpcnull=1
 	fi
@@ -268,10 +271,21 @@ echo "== rpcd backends only write UCI configs their own ACL actually grants =="
 for f in $(find "$PKGDIR" -type f -path '*/rpcd/ucode/*' | sort); do
 	pkgdir="${f%/root/usr/share/rpcd/ucode/*}"
 	acls=$(find "$pkgdir/root/usr/share/rpcd/acl.d" -type f -name '*.json' 2>/dev/null)
-	configs=$(code_of "$f" | grep -oE "uci[^\"']*set[[:space:]]+[A-Za-z0-9_-]+\." \
-	          | sed -E 's/.*set[[:space:]]+//; s/\.$//' | sort -u)
+	# EVERY mutating verb, not just `set`. A method that only deletes, adds to a list or
+	# commits mutates uci just as much and was invisible to this check - luci.fm350 already
+	# contains a bare `uci -q commit h5000m`. jscode_of because these are ucode files: code_of
+	# strips `#` to end-of-line, which would truncate any line containing a `#` inside a string,
+	# and would miss a `//`-commented example write entirely.
+	configs=$(jscode_of "$f" | grep -oE "uci[^\"']*(set|delete|add_list|del_list|rename|commit)[[:space:]]+[A-Za-z0-9_-]+" \
+	          | sed -E 's/.*(set|delete|add_list|del_list|rename|commit)[[:space:]]+//' | sort -u)
 	for cfg in $configs; do
-		if [ -n "$acls" ] && grep -q "\"$cfg\"" $acls 2>/dev/null; then
+		# Scoped to the write.uci array rather than the whole file: a config appearing only
+		# under a read grant would otherwise satisfy a check whose entire subject is writes.
+		# From "write" to EOF, then the "uci" array within that. A plain /"write"/,/}/ range
+		# would stop at the closing brace of the NESTED "ubus" object, which comes before the
+		# "uci" array it is trying to reach - and then match nothing.
+		if [ -n "$acls" ] && sed -n '/"write"/,$p' $acls 2>/dev/null \
+				| sed -n '/"uci"/,/]/p' | grep -q "\"$cfg\""; then
 			ok "$(basename "$f") writes uci '$cfg', granted in its ACL"
 		else
 			bad "$(basename "$f") writes uci '$cfg' but no ACL grants write.uci for it"

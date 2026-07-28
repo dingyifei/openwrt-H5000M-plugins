@@ -251,9 +251,9 @@ fm350-usb-reset                          # recover a deaf AT port (detached, ~70
 
 # Band/slot changes NEVER go through atq - it refuses them - because they must be
 # verified and reverted if the link does not come back.
-printf 'ACTION=band\nRAT=20\nBANDS="103"\nPERSIST=0\n' > /var/run/fm350-radio.req
+printf 'ACTION=band\nRAT=20\nBANDS="103"\n' > /var/run/fm350-radio.req
 # cell lock: an empty CELL_ARFCN clears it (and restores any RAT the lock narrowed)
-printf 'ACTION=cell\nCELL_ARFCN=1650\nCELL_PCI=187\nCELL_LTE_ONLY=1\nPERSIST=0\n' > /var/run/fm350-radio.req
+printf 'ACTION=cell\nCELL_ARFCN=1650\nCELL_PCI=187\nCELL_LTE_ONLY=1\n' > /var/run/fm350-radio.req
 /etc/init.d/fm350-radio start            # apply, verify against DATA, revert on failure
 cat /var/run/fm350-radio.state           # applying|verifying|reverting|ok|failed|reverted
 at-lease lpac chip info                  # hand the port to a foreign tool

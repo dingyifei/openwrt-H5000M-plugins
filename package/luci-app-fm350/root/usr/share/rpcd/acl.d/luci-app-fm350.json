@@ -15,7 +15,8 @@
 					"archive_get"
 				],
 				"service": [ "list" ]
-			}
+			},
+			"uci": [ "network" ]
 		},
 		"write": {
 			"ubus": {
@@ -36,7 +37,6 @@
 			},
 			"uci": [
 				"network",
-				"firewall",
 				"h5000m-ttl",
 				"h5000m"
 			]

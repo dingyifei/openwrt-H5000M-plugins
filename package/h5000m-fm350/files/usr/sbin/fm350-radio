@@ -112,8 +112,23 @@ wait_registered() {
 # the bearer down the modem sat on the locked cell for 90s solid; with the bearer up it held
 # ~35s and the network then moved it to a different PCI and kept it there, at comparable RSRP.
 # So "registered, and data flows" does NOT mean "camped where you asked".
+# ⚠️ `^1,4,` not `^1,`: match the serving row AND require rat=4 (E-UTRAN). Two reasons, both
+# real rather than defensive. Under EN-DC the modem reports a serving row PER RAT, so `^1,`
+# yields several lines and the comparison below would test a multi-line string against a single
+# PCI - never equal, so the guard would announce a handover that never happened. And with
+# CELL_LTE_ONLY=0 (a path the user can choose) the modem may camp on NR, whose PCI is a
+# different namespace from the E-UTRAN PCI that AT+EMMCHLCK takes; comparing them is meaningless.
+# `exit` after the first match keeps it to one row even so.
+#
+# Field 8 is <physicalcellId> for both the LTE and NR serving layouts (manual §11.1.15), and is
+# the same field parse_cell_row() in the rpcd backend reads as f[7] - the two parsers agree, and
+# must be changed together if that ever stops being true.
+#
+# One awk rather than grep|cut|tr: three forks became one, matching this file's stated care about
+# fork count on a ~1 GHz MIPS board.
 serving_pci() {
-	at_one 'AT+GTCCINFO?' 15 2>/dev/null | grep '^1,' | cut -d, -f8 | tr -d ' \r'
+	at_one 'AT+GTCCINFO?' 15 2>/dev/null |
+		awk -F, '/^1,4,/ { gsub(/[ \r]/, "", $8); print $8; exit }'
 }
 
 wait_data() {
@@ -218,14 +233,65 @@ pref_for_rat() {
 # prevent.
 #
 # Fills any empty preference from the string's OWN rat, so the replay means the same thing.
+#
+# ⛔ AND IT MUST NOT APPEND A TRAILING COMMA. The first version ended with an unconditional
+#     printf '%s,%s,%s,%s' ... "$rest"
+# which is correct only when a band list follows. For the very case named above it produced:
+#     14,6,    -> 14,6,6,     <- still a trailing empty field, still `phone failure`
+#     14,6,6   -> 14,6,6,
+# So the helper written to make strings replayable emitted an unreplayable string for every
+# band-less input, and all three revert paths stayed broken while looking fixed. apply_band
+# already had this right (it appends bands only when the list is non-empty); the rule simply
+# was not carried across. A trailing empty field is the SAME defect as a leading empty one.
+#
+# Parameter expansion rather than `cut`: four forks became zero, on a path the rest of this
+# file is careful about.
 gtact_replayable() {
-	_gr_rat=$(printf '%s' "$1" | cut -d, -f1)
-	_gr_p1=$(printf '%s' "$1" | cut -d, -f2)
-	_gr_p2=$(printf '%s' "$1" | cut -d, -f3)
-	_gr_rest=$(printf '%s' "$1" | cut -d, -f4-)
-	[ -n "$_gr_p1" ] || _gr_p1=$(pref_for_rat "$_gr_rat")
-	[ -n "$_gr_p2" ] || _gr_p2=$(pref_for_rat "$_gr_rat")
-	printf '%s,%s,%s,%s' "$_gr_rat" "$_gr_p1" "$_gr_p2" "$_gr_rest"
+	_gr_bands=$(gtact_bands "$1")
+	gtact_join "${1%%,*}" "$(gtact_prefs "$1" "${1%%,*}")" "$_gr_bands"
+}
+
+# --- the three pieces of "build a valid AT+GTACT= string", each with exactly one owner ------
+#
+# These exist because the SAME two rules were open-coded in three places (apply_band, apply_cell
+# and gtact_replayable) and each copy got a different subset of them right. apply_band appended
+# bands conditionally but the other two did not; gtact_replayable filled empty preferences from
+# the string's own RAT but apply_cell hard-codes 2. The result was the identical trailing-comma
+# defect shipped twice, in a helper whose whole purpose was to prevent it. One owner per rule.
+
+# gtact_prefs <gtact string> <rat to fall back on> -> "<p1>,<p2>", empties filled.
+# Callers differ ONLY in the fallback RAT, which is why that is the parameter: a replay uses the
+# string's own RAT, a band apply the requested one, a cell apply the LTE-only 2 it is moving to.
+gtact_prefs() {
+	_gp_s=${1#*,}
+	_gp_p1=${_gp_s%%,*}
+	_gp_s=${_gp_s#*,}
+	_gp_p2=${_gp_s%%,*}
+	[ -n "$_gp_p1" ] || _gp_p1=$(pref_for_rat "$2")
+	[ -n "$_gp_p2" ] || _gp_p2=$(pref_for_rat "$2")
+	printf '%s,%s' "$_gp_p1" "$_gp_p2"
+}
+
+# gtact_bands <gtact string> -> the comma-separated band list, or empty when there is none.
+# `${s#*,}` cannot express "everything after field 3" when field 3 is the last field, so the
+# absence of a further separator is what distinguishes "no bands" from "bands".
+gtact_bands() {
+	_gb_s=${1#*,}; _gb_s=${_gb_s#*,}
+	case "$_gb_s" in
+		*,*) printf '%s' "${_gb_s#*,}" ;;
+		*)   printf '' ;;
+	esac
+}
+
+# gtact_join <rat> <"p1,p2"> <bands or empty> -> the set string.
+# ⛔ THE TRAILING COMMA IS THE WHOLE POINT. `AT+GTACT=14,6,6,` is rejected exactly like the
+# `14,6,` it was built to replace, so the band list may only be appended when it is non-empty.
+gtact_join() {
+	if [ -n "$3" ]; then
+		printf '%s,%s,%s' "$1" "$2" "$3"
+	else
+		printf '%s,%s' "$1" "$2"
+	fi
 }
 
 apply_band() {
@@ -242,14 +308,10 @@ apply_band() {
 	# The empty-field form the manual's brackets imply, `AT+GTACT=20,,,103`, is ALSO
 	# rejected on this firmware ("+CME ERROR: phone failure"), so the preferences cannot be
 	# omitted either. Carry forward whatever the modem currently reports.
-	_ab_p1=$(printf '%s' "$_ab_prev" | cut -d, -f2)
-	_ab_p2=$(printf '%s' "$_ab_prev" | cut -d, -f3)
 	# An empty carried-forward preference is rejected on the way back in - see pref_for_rat.
-	[ -n "$_ab_p1" ] || _ab_p1=$(pref_for_rat "$RAT")
-	[ -n "$_ab_p2" ] || _ab_p2=$(pref_for_rat "$RAT")
-
-	_ab_new="${RAT},${_ab_p1},${_ab_p2}"
-	[ -n "$BANDS" ] && for _b in $BANDS; do _ab_new="${_ab_new},${_b}"; done
+	_ab_bands=''
+	for _b in $BANDS; do _ab_bands="${_ab_bands:+${_ab_bands},}${_b}"; done
+	_ab_new=$(gtact_join "$RAT" "$(gtact_prefs "$_ab_prev" "$RAT")" "$_ab_bands")
 
 	say applying "AT+GTACT=${_ab_new}"
 	log_info 'applying band configuration %s (previous %s)' "$_ab_new" "$_ab_prev"
@@ -388,17 +450,29 @@ apply_cell() {
 	# camp on NR and ignore the lock entirely. The FULL previous band list is passed through
 	# so narrowing the RAT does not silently discard a band lock set earlier.
 	if [ "${CELL_LTE_ONLY:-0}" = 1 ]; then
-		_ac_p1=$(printf '%s' "$_ac_prev_act" | cut -d, -f2)
-		_ac_p2=$(printf '%s' "$_ac_prev_act" | cut -d, -f3)
-		_ac_bands=$(printf '%s' "$_ac_prev_act" | cut -d, -f4-)
 		# The modem drops an NR preference under an LTE-only RAT and then refuses to take the
-		# empty field back, so substitute one that is valid for RAT 2 rather than pass it on.
-		[ -n "$_ac_p1" ] || _ac_p1=$(pref_for_rat 2)
-		[ -n "$_ac_p2" ] || _ac_p2=$(pref_for_rat 2)
-		# Written only if absent, so re-locking does not overwrite the ORIGINAL pre-lock value
-		# with an already-narrowed one and strand the user on LTE forever.
-		[ -e "$PREVACT" ] || printf '%s' "$_ac_prev_act" > "$PREVACT"
-		at_one "AT+GTACT=2,${_ac_p1},${_ac_p2},${_ac_bands}" 20 >/dev/null
+		# empty field back, so substitute one valid for RAT 2 rather than pass it on. Built
+		# through the shared helpers: the hand-rolled version here appended the band list
+		# unconditionally and so emitted `AT+GTACT=2,3,3,` - rejected - whenever the previous
+		# string carried no bands.
+		#
+		# The restore record is written FIRST and its success CHECKED, because everything after
+		# this narrows the radio. Losing the record while still narrowing is the one ordering
+		# that strands the user on LTE with no way back, which is the failure this whole path
+		# exists to prevent. mkdir -p mirrors what apply_slot already does for its own record.
+		if [ ! -e "$PREVACT" ]; then
+			mkdir -p "${PREVACT%/*}" 2>/dev/null
+			# Written only if absent, so re-locking does not overwrite the ORIGINAL pre-lock
+			# value with an already-narrowed one and strand the user on LTE forever.
+			if ! printf '%s' "$_ac_prev_act" > "$PREVACT" 2>/dev/null; then
+				say failed 'could not save the pre-lock radio configuration; refusing to restrict to LTE'
+				log_warn 'cannot write %s; not narrowing the RAT' "$PREVACT"
+				at_one 'AT+CFUN=1' 20 >/dev/null
+				iface_up
+				return 1
+			fi
+		fi
+		at_one "AT+GTACT=$(gtact_join 2 "$(gtact_prefs "$_ac_prev_act" 2)" "$(gtact_bands "$_ac_prev_act")")" 20 >/dev/null
 	fi
 
 	at_one 'AT+CFUN=1' 20 >/dev/null
