@@ -7,7 +7,10 @@
 #
 # Contract with netifd: publish the granted address with proto_send_update, then stay alive
 # and re-publish whenever the network renumbers us. An address change is a re-publish, never
-# a re-dial, and a single-family grant is a success.
+# a re-dial, and a single-family grant is a success. The one exception is a probe-confirmed
+# DEAD bearer: the modem keeps advertising a stale CGPADDR after the carrier drops the data
+# plane, so the watchdog (fm350-watchdog.sh) actively probes the data path and, on sustained
+# failure, requests a teardown/re-dial - see the monitor loop and the recovery ladder.
 #
 # Deliberately NOT `set -u`: OpenWrt's /lib/functions.sh dereferences $IPKG_INSTROOT unset,
 # which would kill this script on source - and netifd respawns a proto command that exits,
@@ -22,6 +25,9 @@
 . /usr/lib/h5000m/log.sh
 . /usr/lib/h5000m/atio.sh
 . /usr/lib/h5000m/modem-discover.sh
+# The watchdog defines the data-path probe and the recovery ladder. Sourced here (defaults
+# set now) so the arg parser below can override its tunables; it has no side effects on source.
+. /usr/lib/h5000m/fm350-watchdog.sh
 
 APN_TABLE=/usr/lib/h5000m/apn-table
 
@@ -42,6 +48,17 @@ while [ $# -gt 0 ]; do
 		-m) METRIC="$2"; shift 2 ;;
 		-u) MTU="$2"; shift 2 ;;
 		-d) PEERDNS="$2"; shift 2 ;;
+		# Watchdog tunables (defaults live in fm350-watchdog.sh; the proto passes these
+		# with UCI-or-default values so they are never empty).
+		--watchdog)          WATCHDOG="$2"; shift 2 ;;
+		--probe-targets)     PROBE_TARGETS="$2"; shift 2 ;;
+		--probe-interval)    PROBE_INTERVAL="$2"; shift 2 ;;
+		--probe-timeout)     PROBE_TIMEOUT="$2"; shift 2 ;;
+		--probe-fails)       PROBE_FAILS="$2"; shift 2 ;;
+		--redial-limit)      REDIAL_LIMIT="$2"; shift 2 ;;
+		--modem-reset-limit) MODEM_RESET_LIMIT="$2"; shift 2 ;;
+		--reboot-limit)      REBOOT_LIMIT="$2"; shift 2 ;;
+		--healthy-hold)      HEALTHY_HOLD="$2"; shift 2 ;;
 		*) shift ;;
 	esac
 done
@@ -55,9 +72,6 @@ REPUBLISH=0
 AID=""
 LAST_IP=""
 PDP_DOWN_STREAK=0
-BLACKHOLE=0
-LAST_TX=0
-LAST_RX=0
 
 # Re-init after atio.sh (which registers itself as modem_atd): inside THIS process every
 # line, including the AT traces atio.sh emits, belongs to the dialer and should be governed
@@ -346,8 +360,16 @@ ip=$(ipv4_of "$AID")
 # probe needs the route that only publishing installs.
 publish "$ip"
 
+# Loop cadence: with the watchdog on we tick at PROBE_INTERVAL (so a dead bearer is caught
+# within PROBE_FAILS*PROBE_INTERVAL); with it off we keep the original 30s address poll.
+# Plain sleep, never a deadline - no RTC (see the modem-wait note above).
+[ "$WATCHDOG" = 1 ] && TICK="$PROBE_INTERVAL" || TICK="$POLL_INTERVAL"
+HEALTHY_NEED=$(healthy_cycles)
+HEALTHY_STREAK=0
+PROBE_FAIL=0
+
 while :; do
-	sleep "$POLL_INTERVAL" &
+	sleep "$TICK" &
 	wait $! 2>/dev/null
 
 	if [ "$REPUBLISH" = 1 ]; then
@@ -363,7 +385,8 @@ while :; do
 		# than a dropped bearer.
 		PDP_DOWN_STREAK=$(( PDP_DOWN_STREAK + 1 ))
 		if [ "$PDP_DOWN_STREAK" -ge 2 ]; then
-			warn "bearer lost (confirmed); requesting teardown"
+			warn "bearer lost (CGPADDR empty, confirmed); requesting recovery"
+			bearer_recover "$INTERFACE" "cgpaddr-empty" >/dev/null
 			proto_notify_error "$INTERFACE" BEARER_LOST
 			exit 1
 		fi
@@ -371,21 +394,32 @@ while :; do
 	fi
 	PDP_DOWN_STREAK=0
 
-	[ "$cur" != "$LAST_IP" ] && { log "address changed ${LAST_IP} -> ${cur}"; publish "$cur"; continue; }
+	[ "$cur" != "$LAST_IP" ] && { log "address changed ${LAST_IP} -> ${cur}"; HEALTHY_STREAK=0; publish "$cur"; continue; }
 
-	# Never ping the .1 pseudo-gateway - it does not answer. Watch the counters instead:
-	# tx climbing while rx stays flat is the signature of a context RNDIS is not carrying,
-	# so log which aids are active, since more than one is the known cause.
-	tx=$(cat "/sys/class/net/${MODEM_NETDEV}/statistics/tx_packets" 2>/dev/null || echo 0)
-	rx=$(cat "/sys/class/net/${MODEM_NETDEV}/statistics/rx_packets" 2>/dev/null || echo 0)
-	if [ "$tx" -gt "$LAST_TX" ] && [ "$rx" -le "$LAST_RX" ]; then
-		BLACKHOLE=$(( BLACKHOLE + 1 ))
-		if [ "$BLACKHOLE" -ge 3 ]; then
-			warn "tx rising, rx flat for 3 windows - active aids: $(active_aids | tr '\n' ' ')"
-			BLACKHOLE=0
+	# Active data-path probe. The modem keeps advertising a stale CGPADDR after the carrier
+	# tears the bearer down, so holding an address is NOT proof data flows - the old tx/rx
+	# heuristic missed exactly this (and was dormant whenever a second uplink stole the
+	# default route, leaving eth2 idle). Recovery is gated on a sustained-failure streak, and
+	# success only clears the ladder once data has HELD for HEALTHY_HOLD, so a marginal link
+	# that flaps re-dials without storming up the escalation tiers.
+	[ "$WATCHDOG" = 1 ] || continue
+	if probe_ok "$MODEM_NETDEV"; then
+		PROBE_FAIL=0
+		if [ "$HEALTHY_STREAK" -lt "$HEALTHY_NEED" ]; then
+			HEALTHY_STREAK=$(( HEALTHY_STREAK + 1 ))
+			if [ "$HEALTHY_STREAK" -ge "$HEALTHY_NEED" ]; then
+				[ "$(recov_read "$INTERFACE")" = 0 ] || log "data path healthy for ~${HEALTHY_HOLD}s; clearing recovery counters"
+				probe_recovered "$INTERFACE"
+			fi
 		fi
 	else
-		BLACKHOLE=0
+		HEALTHY_STREAK=0
+		PROBE_FAIL=$(( PROBE_FAIL + 1 ))
+		if [ "$PROBE_FAIL" -ge "$PROBE_FAILS" ]; then
+			warn "data path down: ${PROBE_FAIL} failed probe cycles over ${MODEM_NETDEV}; active aids: $(active_aids | tr '\n' ' ')"
+			bearer_recover "$INTERFACE" "probe" >/dev/null
+			proto_notify_error "$INTERFACE" BEARER_LOST
+			exit 1
+		fi
 	fi
-	LAST_TX="$tx"; LAST_RX="$rx"
 done

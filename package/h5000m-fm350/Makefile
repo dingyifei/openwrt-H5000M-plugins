@@ -44,6 +44,8 @@ define Package/h5000m-fm350/install
 	$(INSTALL_BIN) ./files/etc/init.d/fm350-radio $(1)/etc/init.d/fm350-radio
 	$(INSTALL_DIR) $(1)/usr/lib/h5000m
 	$(INSTALL_DATA) ./files/usr/lib/h5000m/apn-table $(1)/usr/lib/h5000m/apn-table
+	$(INSTALL_DATA) ./files/usr/lib/h5000m/fm350-watchdog.sh \
+		$(1)/usr/lib/h5000m/fm350-watchdog.sh
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/98-h5000m-fm350 \
 		$(1)/etc/uci-defaults/98-h5000m-fm350

@@ -11,3 +11,7 @@
 # back with it, unlock has nothing to restore and silently leaves the radio pinned to LTE.
 /etc/h5000m/fm350-radio.prevact
 /etc/h5000m/simslot.pending
+# The dialer's reboot guard bounds how many times a stuck bearer may reboot the router. A
+# sysupgrade that reset it to zero would hand a still-broken link a fresh budget of reboots,
+# so it has to survive the upgrade too. One file per interface (glob).
+/etc/h5000m/fm350-*.reboot-guard

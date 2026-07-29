@@ -172,6 +172,23 @@ runs anywhere a `ucode` binary exists — but making it "skip" when that binary 
 rejected, because a skipped test reads exactly like a passing one, the failure mode this repo has
 already been bitten by.
 
+## `test-fm350-recovery-ladder.sh` — 39 unit tests
+
+Exercises the FM350 dead-bearer recovery ladder (`/usr/lib/h5000m/fm350-watchdog.sh`) sourced
+directly — the library has no side effects on source, so the tier logic runs with no modem.
+Every irreversible action is redirected to a recording stub: `ping` is stubbed on `PATH`
+(deterministic per target), and `fm350-usb-reset` / `reboot` are pointed at scripts that only
+append to a log via the library's `FM350_USB_RESET` / `FM350_REBOOT_CMD` seams; the two counter
+files are redirected off the real system via `FM350_RECOV_DIR` / `FM350_GUARD_DIR`.
+
+The invariants it pins are exactly the ones a mocked run can prove and hardware cannot: the
+`ladder_tier` mapping (re-dial ×N → modem-reset ×M → reboot, cyclic so a refused reboot keeps
+the link cycling), that the reboot guard caps reboots and then **refuses** (a stuck carrier must
+not reboot-loop the router), that `reboot_limit=0` disables the reboot tier, that `probe_ok` is
+any-success/all-fail, that `healthy_hold` clears both counters, and that a corrupt counter file
+reads as 0. Each has a **negative control** (e.g. an off-by-one at the `redial_limit` boundary),
+verifiable by running the suite against a deliberately-broken copy via `H5TEST_LIB`.
+
 ## Still worth writing
 
 - mwan3 policy: member ordering, no hard-coded `eth2`, `tailscale0` excluded
