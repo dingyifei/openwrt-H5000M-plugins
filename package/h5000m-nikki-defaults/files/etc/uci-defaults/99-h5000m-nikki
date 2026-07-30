@@ -1,0 +1,35 @@
+#!/bin/sh
+# H5000M nikki default profile — idempotent first-boot setup.
+#
+# If no nikki profile exists yet, install the credential-free JMS/mihomo template and point
+# nikki at it. Hard rules: NEVER overwrite a profile the user already has (that guard is the
+# whole point), NEVER fill in a subscription URL, NEVER enable nikki - routing all traffic
+# through a proxy is the user's explicit choice, made in the LuCI app.
+#
+# No `set -e`: `uci -q get` on an absent key returns non-zero, which would abort under set -e.
+# Matches the other 99-h5000m-* defaults; each step below is individually idempotent.
+
+TEMPLATE=/usr/share/h5000m/nikki-jms-profile.yaml
+PROFILE_DIR=/etc/nikki/profiles
+PROFILE="${PROFILE_DIR}/jms.yaml"
+
+[ -f "$TEMPLATE" ] || exit 0
+
+# Act only when the user has no jms profile. A profile they already configured (with their real
+# subscription URL) survives untouched - and config-preserving sysupgrade keeps it across flashes.
+if [ ! -f "$PROFILE" ]; then
+	mkdir -p "$PROFILE_DIR"
+	cp "$TEMPLATE" "$PROFILE"
+	# Point nikki at the file profile, but only when it is unset or still the stock
+	# 'subscription:*' (which cannot consume JMS's base64 sub anyway). Never clobber a
+	# 'file:*' profile the user deliberately chose.
+	cur="$(uci -q get nikki.config.profile)"
+	case "$cur" in
+		''|subscription:*)
+			uci -q set nikki.config.profile='file:jms'
+			uci -q commit nikki
+			;;
+	esac
+fi
+
+exit 0
