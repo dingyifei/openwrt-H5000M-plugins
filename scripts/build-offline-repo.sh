@@ -65,8 +65,12 @@ mapfile -t FEATURE_PKGS < <(awk -v want="[${FEATURE_SET}]" '
 # contains upstream names. Reading it back here made is_ours() claim upstream packages
 # (464xlat, the kmods, ...) as ours and then look for them in bin/h5000m/, where they
 # obviously are not. build-list is by definition exactly what we build.
-mapfile -t OUR_NAMES < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' \
-  configs/build-list)
+mapfile -t OUR_NAMES < <( {
+    sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' configs/build-list
+    # third-party packages we build + sign from source (configs/sources.lock `builds=`) are
+    # ALSO ours — they live in the h5000m feed, not upstream, so never demux them to official/.
+    sed -n 's/^[[:space:]]*builds[[:space:]]*=[[:space:]]*//p' configs/sources.lock | tr ' ' '\n'
+  } | sed -e '/^[[:space:]]*$/d' )
 is_ours() { local n="$1"; for o in "${OUR_NAMES[@]}"; do [ "$n" = "$o" ] && return 0; done; return 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT

@@ -1,5 +1,6 @@
 # build outputs / fetched toolchains — never committed
 /sdk/
+/.sources/
 /build_dir/
 /staging_dir/
 /bin/

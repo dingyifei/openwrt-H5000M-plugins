@@ -49,9 +49,20 @@ file_sha256() {
 }
 key_fingerprint() { openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256_hex; }
 
-# --- third-party source stub (loud) ---
-sources_nonblank="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' configs/sources.lock || true)"
-[ -z "${sources_nonblank}" ] || fail "configs/sources.lock is non-empty but source-built packages are not implemented in this batch — refusing to silently skip them"
+# --- third-party sources ---
+# Packages pinned in configs/sources.lock are fetched + symlinked into the h5000m feed by
+# configure-sdk.sh (via fetch-sources.sh), so here they build exactly like first-party ones.
+# Unlike the noarch-only build-list, a source package may be arch-specific (a compiled binary).
+# Build a name->source map so packages.lock records provenance ("custom" vs the source name).
+declare -A PKG_SOURCE
+src_name=""
+while IFS= read -r line; do
+  case "${line}" in
+    \#*) continue ;;
+    \[*\]) src_name="${line#[}"; src_name="${src_name%]}" ;;
+    *builds*=*) for p in ${line#*=}; do PKG_SOURCE["${p}"]="${src_name}"; done ;;
+  esac
+done < configs/sources.lock
 
 # --- key drift guard ---
 placed_fpr="$(key_fingerprint "${SDK}/private-key.pem")"
@@ -71,6 +82,10 @@ apk_field() {  # apk_field <file> <field>  — read a top-level scalar from the 
 # --- build each package ---
 mapfile -t BUILD_PKGS < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]//g' configs/build-list)
 [ "${#BUILD_PKGS[@]}" -gt 0 ] || fail "configs/build-list is empty"
+# Source-built packages come AFTER the first-party ones (sources.lock `builds=` order is the
+# dependency order, e.g. mihomo-meta before nikki before luci-app-nikki).
+mapfile -t SRC_PKGS < <(sed -n 's/^[[:space:]]*builds[[:space:]]*=[[:space:]]*//p' configs/sources.lock | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
+BUILD_PKGS=( "${BUILD_PKGS[@]}" "${SRC_PKGS[@]}" )
 
 rm -rf "${ROOT_DIR}/bin/h5000m"
 mkdir -p "${ROOT_DIR}/bin/h5000m"
@@ -111,19 +126,34 @@ for pkg in "${BUILD_PKGS[@]}"; do
   version="$(apk_field "${apkf}" version)"
   arch="$(apk_field "${apkf}" arch)"
   [ -n "${name}" ] && [ -n "${version}" ] || fail "${pkg}: could not read name/version from ${apkf}"
-  [ "${arch}" = "noarch" ] || fail "${pkg}: arch is '${arch}', expected noarch (PKGARCH:=all)"
+  # First-party recipes are PKGARCH:=all (noarch); a third-party source package may be compiled
+  # for the target arch. Anything else (a foreign arch) is a real error.
+  pkg_src="${PKG_SOURCE[${pkg}]:-custom}"
+  case "${arch}" in
+    noarch) ;;
+    "${OPENWRT_ARCH}") [ "${pkg_src}" != custom ] || fail "${pkg}: first-party package is arch '${arch}', expected noarch" ;;
+    *) fail "${pkg}: unexpected arch '${arch}' (want noarch or ${OPENWRT_ARCH})" ;;
+  esac
 
   cp "${apkf}" "${ROOT_DIR}/bin/h5000m/"
   sha="$(file_sha256 "${apkf}")"
-  LOCK_ROWS+=("${name}	${version}	${arch}	${sha}	custom")
+  LOCK_ROWS+=("${name}	${version}	${arch}	${sha}	${pkg_src}")
   echo "   ${name} ${version} ${arch} signed+verified (${sha})"
 done
 
 # --- signed index over our feed ---
 echo ">> make package/index (signed packages.adb)"
 ( cd "${SDK}" && make package/index ) || fail "package/index failed"
-index="$(find "${SDK}/bin/packages" -type f -path '*/h5000m/packages.adb' | head -1)"
-[ -n "${index}" ] || fail "no h5000m/packages.adb produced by package/index"
+# Log the full h5000m feed output layout — with an arch-specific package now in the feed this
+# is where apk could split noarch vs arch into separate index dirs. Assert exactly one so a
+# split surfaces loudly (with paths) instead of a silently partial index.
+mapfile -t indexes < <(find "${SDK}/bin/packages" -type f -path '*/h5000m/packages.adb' | sort)
+echo "   h5000m index dirs found: ${#indexes[@]}"
+printf '     %s\n' "${indexes[@]}"
+find "${SDK}/bin/packages" -type f -path '*/h5000m/*.apk' -printf '     apk %p\n' 2>/dev/null | sort || true
+[ "${#indexes[@]}" -ge 1 ] || fail "no h5000m/packages.adb produced by package/index"
+[ "${#indexes[@]}" -eq 1 ] || fail "expected ONE h5000m index, found ${#indexes[@]} (arch/noarch split — offline-repo harvest must be taught both)"
+index="${indexes[0]}"
 imagic="$(dd if="${index}" bs=1 count=4 2>/dev/null)"
 [ "${imagic}" = "ADBd" ] || fail "packages.adb bad magic '${imagic}'"
 "${APK}" verify --keys-dir "${TRUST_DIR}" "${index}" >/dev/null 2>&1 || fail "signed index failed verification"

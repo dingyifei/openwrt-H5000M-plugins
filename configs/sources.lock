@@ -17,3 +17,17 @@
 #   builds = luci-app-passwall2 passwall2
 #
 # (proxy engines sing-box/xray/v2ray/hysteria/trojan come from the OFFICIAL feed — not here)
+#
+# `commit` is the immutable reproducibility anchor: configure-sdk.sh adds one
+# `src-git <name> <repo>.git^<commit>` feed line per entry, so the SDK clones the exact tree
+# (OpenWrt's own feeds machinery, same commit-pinned form as the base/snapshot feeds). `sha256`
+# is the GitHub codeload archive hash at that commit, recorded as provenance. `builds` is the
+# subset of the repo's packages we select and sign — a compiled (arch-specific) package is
+# allowed here, unlike the noarch-only first-party build-list.
+
+[OpenWrt-nikki]
+repo   = https://github.com/nikkinikki-org/OpenWrt-nikki
+commit = 34a036708c4e163f11194b2952cd87ef386486ed
+sha256 = e032860965b9640b682e871254e00f1f4e5be01c677111b81fbde5b3335185d2
+license= GPL-3.0-only
+builds = mihomo-meta nikki luci-app-nikki
