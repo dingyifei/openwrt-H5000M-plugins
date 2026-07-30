@@ -120,8 +120,16 @@ jobs:
 
       # build-offline-repo.sh regenerates configs/packages.lock in place (ours + the resolved
       # official closure). It cannot be regenerated on a non-amd64 dev host, so publish it here
-      # for review / committing back.
+      # for review / committing back. build-offline-repo runs under sudo, so the file is
+      # root-owned - make it readable before upload. Both steps are continue-on-error: this is
+      # a convenience artifact and must never fail the release build (a failure here would also
+      # make the base loaded-image build skip this run).
+      - name: Make packages.lock readable
+        if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
+        continue-on-error: true
+        run: sudo chmod a+r configs/packages.lock
       - uses: actions/upload-artifact@v4
         if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
+        continue-on-error: true
         with: { name: packages-lock, path: configs/packages.lock }
 # NOTE: release signing uses a protected persistent key; never log private material.
