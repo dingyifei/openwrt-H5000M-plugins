@@ -2,30 +2,38 @@
 #
 # Installed to /etc/nikki/profiles/jms.yaml by h5000m-nikki-defaults ONLY when no profile
 # already exists, and nikki is pointed at it (profile 'file:jms'). To use it:
-#   1. Paste your JMS subscription URL into `url:` below (Services -> your JMS service ->
-#      the "Subscription" link). JMS returns a base64 ss/vless/vmess list, which mihomo
-#      parses directly as a proxy-provider (nikki's built-in "Subscription" page cannot -
-#      it expects Clash YAML).
+#   1. JMS gives you TWO mirror subscription domains for the same service (jjsubmarines.com and
+#      jmssub.net). Paste your sub URL into BOTH `url:` fields below (same service/id, just the
+#      two domains) - if one domain is blocked, the other still delivers the node list.
+#      JMS returns a base64 ss/vless/vmess list, which mihomo parses directly as a
+#      proxy-provider (nikki's built-in "Subscription" page cannot - it expects Clash YAML).
 #   2. LuCI -> Services -> Nikki -> Enable (this transparently proxies LAN/router traffic).
 #
-# What you get: hourly subscription auto-refresh (last-good kept on a failed fetch) and
-# health-checked AUTO failover - url-test routes through the lowest-latency working node,
-# moves off a dead one, and back when it recovers. nikki's mixin supplies ports/tun/dns/sniffer.
+# What you get: hourly subscription auto-refresh (last-good kept on a failed fetch), mirror-domain
+# resilience (two providers), and health-checked AUTO failover - url-test routes through the
+# lowest-latency working node across BOTH providers, moves off a dead one, and back when it
+# recovers. nikki's mixin supplies ports/tun/dns/sniffer.
 proxy-providers:
   jms:
     type: http
-    url: "PASTE_YOUR_JUSTMYSOCKS_SUBSCRIPTION_URL_HERE"
+    url: "https://jjsubmarines.com/members/getsub.php?service=YOUR_SERVICE&id=YOUR_ID"
     path: ./providers/jms.yaml
+    interval: 3600
+    health-check: { enable: true, url: "https://www.gstatic.com/generate_204", interval: 60, timeout: 2000, lazy: true }
+  jms-backup:
+    type: http
+    url: "https://jmssub.net/members/getsub.php?service=YOUR_SERVICE&id=YOUR_ID"
+    path: ./providers/jms-backup.yaml
     interval: 3600
     health-check: { enable: true, url: "https://www.gstatic.com/generate_204", interval: 60, timeout: 2000, lazy: true }
 proxy-groups:
   - name: PROXY
     type: select
     proxies: [AUTO]
-    use: [jms]
+    use: [jms, jms-backup]
   - name: AUTO
     type: url-test
-    use: [jms]
+    use: [jms, jms-backup]
     url: "https://www.gstatic.com/generate_204"
     interval: 60
     tolerance: 50
