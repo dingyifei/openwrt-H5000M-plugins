@@ -412,6 +412,33 @@ for f in $(find "$PKGDIR" -type f -path '*/rpcd/ucode/*' | sort); do
 	fi
 done
 
+# configs/sources.lock is the ONLY provenance for third-party source-built packages (they are
+# gitignored, fetched at build time). A pin that is not commit-anchored + hash-verified is a
+# reproducibility hole, so assert every entry carries a 40-hex commit, a 64-hex sha256, a
+# license and a builds list. A for-loop over section names (never a `... | while read`) so the
+# ok/bad counters survive - the same subshell trap the rest of this file avoids.
+echo "== configs/sources.lock pins are well-formed =="
+SRCLOCK="${ROOT}/configs/sources.lock"
+srclock_sections="$(grep -oE '^\[[^]]+\]' "$SRCLOCK" 2>/dev/null | tr -d '[]')"
+if [ -z "$srclock_sections" ]; then
+	ok "sources.lock has no third-party pins (nothing to verify)"
+else
+	for name in $srclock_sections; do
+		block="$(awk -v s="[$name]" '$0==s{f=1;next} /^\[/{f=0} f' "$SRCLOCK")"
+		commit="$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*commit[[:space:]]*=[[:space:]]*//p'  | tr -d '[:space:]')"
+		sha="$(printf '%s\n'    "$block" | sed -n 's/^[[:space:]]*sha256[[:space:]]*=[[:space:]]*//p'  | tr -d '[:space:]')"
+		lic="$(printf '%s\n'    "$block" | sed -n 's/^[[:space:]]*license[[:space:]]*=[[:space:]]*//p' | tr -d '[:space:]')"
+		blds="$(printf '%s\n'   "$block" | sed -n 's/^[[:space:]]*builds[[:space:]]*=[[:space:]]*//p')"
+		err=""
+		printf '%s' "$commit" | grep -qE '^[0-9a-f]{40}$' || err="$err commit"
+		printf '%s' "$sha"    | grep -qE '^[0-9a-f]{64}$' || err="$err sha256"
+		[ -n "$lic" ]  || err="$err license"
+		[ -n "$blds" ] || err="$err builds"
+		if [ -z "$err" ]; then ok "sources.lock [$name] well-formed"
+		else bad "sources.lock [$name] malformed:$err"; fi
+	done
+fi
+
 echo
 echo "checks=${checks} failures=${fails}"
 [ "$fails" -eq 0 ] || exit 1
