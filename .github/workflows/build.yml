@@ -117,4 +117,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
         with: { name: offline-repo, path: offline-repo/ }
+
+      # build-offline-repo.sh regenerates configs/packages.lock in place (ours + the resolved
+      # official closure). It cannot be regenerated on a non-amd64 dev host, so publish it here
+      # for review / committing back.
+      - uses: actions/upload-artifact@v4
+        if: steps.base.outcome == 'success' && steps.key.outputs.mode == 'release'
+        with: { name: packages-lock, path: configs/packages.lock }
 # NOTE: release signing uses a protected persistent key; never log private material.
