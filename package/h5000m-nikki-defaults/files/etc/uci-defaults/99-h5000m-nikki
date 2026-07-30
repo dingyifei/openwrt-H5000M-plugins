@@ -23,10 +23,12 @@ if [ ! -f "$PROFILE" ]; then
 	# Point nikki at the file profile, but only when it is unset or still the stock
 	# 'subscription:*' (which cannot consume JMS's base64 sub anyway). Never clobber a
 	# 'file:*' profile the user deliberately chose.
+	# The id is the filename VERBATIM: nikki resolves file:<id> to $PROFILES_DIR/<id> with no
+	# extension appended (see /etc/init.d/nikki), so it must include the .yaml.
 	cur="$(uci -q get nikki.config.profile)"
 	case "$cur" in
 		''|subscription:*)
-			uci -q set nikki.config.profile='file:jms'
+			uci -q set nikki.config.profile='file:jms.yaml'
 			uci -q commit nikki
 			;;
 	esac
